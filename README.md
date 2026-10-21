@@ -125,6 +125,12 @@ cargo clippy -p satomic-swap -- -D warnings
 cargo +nightly clippy -p htlc-tests --tests -- -D warnings
 ```
 
+## Deploying
+
+See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for the runbook: backing up the program keypair,
+choosing an upgrade-authority policy, the devnet and mainnet steps, and how to publish a build
+anyone can verify against the audited commit.
+
 ## Status
 
 | | |

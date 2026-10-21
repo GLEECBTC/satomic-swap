@@ -33,6 +33,8 @@ const LOCK_TIME: u64 = 1_800_000_000;
 const E_INVALID_SECRET: u32 = 6002;
 const E_LOCK_TIME_NOT_EXPIRED: u32 = 6003;
 const E_TRANSFER_FEE_NOT_SUPPORTED: u32 = 6007;
+const E_ZERO_AMOUNT: u32 = 6000;
+const E_INVALID_RECEIVER: u32 = 6001;
 
 struct Ctx {
     svm: LiteSVM,
@@ -273,6 +275,46 @@ impl Ctx {
     /// Sends `ix` paid for and signed only by `payer`, leaving any other required signature
     /// missing. This is what impersonation actually looks like: the attacker names the real
     /// counterparty so the PDA still resolves, and then cannot sign for them.
+    /// A payment with an arbitrary receiver and amount, for the rejection cases.
+    fn pay_with(&mut self, receiver: Pubkey, amount: u64) -> Result<TransactionMetadata, TxFailure> {
+        let payment = Pubkey::find_program_address(
+            &[
+                b"payment_spl",
+                self.sender.pubkey().as_ref(),
+                receiver.as_ref(),
+                self.mint.as_ref(),
+                &self.secret_hash,
+                &LOCK_TIME.to_le_bytes(),
+                &amount.to_le_bytes(),
+            ],
+            &PROGRAM_ID,
+        )
+        .0;
+        let ix = Instruction {
+            program_id: PROGRAM_ID,
+            accounts: satomic_swap::accounts::SplPayment {
+                sender: self.sender.pubkey(),
+                receiver,
+                mint: self.mint,
+                sender_token_account: ata(&self.sender.pubkey(), &self.mint, &self.token_program),
+                payment,
+                vault: ata(&payment, &self.mint, &self.token_program),
+                token_program: self.token_program,
+                associated_token_program: ATA_PROGRAM,
+                system_program: solana_system_interface::program::ID,
+            }
+            .to_account_metas(None),
+            data: satomic_swap::instruction::SplPayment {
+                secret_hash: self.secret_hash,
+                lock_time: LOCK_TIME,
+                amount,
+            }
+            .data(),
+        };
+        let sender = self.sender.insecure_clone();
+        self.send(ix, &sender)
+    }
+
     fn send_without_all_signatures(&mut self, ix: Instruction, payer: &Keypair) -> Result<TransactionMetadata, TxFailure> {
         let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
         tx.partial_sign(&[payer], self.svm.latest_blockhash());
@@ -512,5 +554,33 @@ fn the_receiver_cannot_send_the_tokens_to_someone_else() {
     assert!(
         ctx.send(ix, &receiver).is_err(),
         "the destination must belong to the receiver named in the seeds"
+    );
+}
+
+// --- Payment constraints ---
+
+#[test]
+fn a_zero_amount_spl_payment_is_rejected() {
+    let mut ctx = setup(SPL_TOKEN, None);
+    let receiver = ctx.receiver.pubkey();
+
+    assert_eq!(ctx.pay_with(receiver, 0).unwrap_err().code(), E_ZERO_AMOUNT);
+}
+
+#[test]
+fn an_spl_payment_to_myself_is_rejected() {
+    let mut ctx = setup(SPL_TOKEN, None);
+    let sender = ctx.sender.pubkey();
+
+    assert_eq!(ctx.pay_with(sender, AMOUNT).unwrap_err().code(), E_INVALID_RECEIVER);
+}
+
+#[test]
+fn an_spl_payment_to_the_default_pubkey_is_rejected() {
+    let mut ctx = setup(SPL_TOKEN, None);
+
+    assert_eq!(
+        ctx.pay_with(Pubkey::default(), AMOUNT).unwrap_err().code(),
+        E_INVALID_RECEIVER
     );
 }

@@ -24,6 +24,8 @@ const LOCK_TIME: u64 = 1_800_000_000;
 // Anchor numbers custom errors from 6000 in declaration order.
 const E_INVALID_SECRET: u32 = 6002;
 const E_LOCK_TIME_NOT_EXPIRED: u32 = 6003;
+const E_ZERO_AMOUNT: u32 = 6000;
+const E_INVALID_RECEIVER: u32 = 6001;
 
 struct Ctx {
     svm: LiteSVM,
@@ -121,6 +123,29 @@ impl Ctx {
         let sender = self.sender.insecure_clone();
         let meta = self.send(ix, &sender).expect("payment should succeed");
         (payment, meta)
+    }
+
+    /// A payment with an arbitrary receiver and amount, for the rejection cases.
+    fn pay_with(&mut self, receiver: Pubkey, amount: u64) -> Result<TransactionMetadata, TxFailure> {
+        let payment = payment_pda(&self.sender.pubkey(), &receiver, &self.secret_hash, amount);
+        let ix = Instruction {
+            program_id: PROGRAM_ID,
+            accounts: satomic_swap::accounts::LamportsPayment {
+                sender: self.sender.pubkey(),
+                receiver,
+                payment,
+                system_program: solana_system_interface::program::ID,
+            }
+            .to_account_metas(None),
+            data: satomic_swap::instruction::LamportsPayment {
+                secret_hash: self.secret_hash,
+                lock_time: LOCK_TIME,
+                amount,
+            }
+            .data(),
+        };
+        let sender = self.sender.insecure_clone();
+        self.send(ix, &sender)
     }
 
     fn spend_ix(&self, payment: Pubkey, secret: [u8; 32], amount: u64) -> Instruction {
@@ -420,4 +445,37 @@ fn the_partial_signing_helper_still_admits_a_legitimate_spend() {
     ctx.send_without_all_signatures(ix, &receiver)
         .expect("the receiver is the only required signer, so this is fully signed");
     assert_eq!(ctx.svm.get_balance(&payment).unwrap_or(0), 0, "payment was settled");
+}
+
+// --- Payment constraints ---
+
+/// A zero-amount payment would create an account holding nothing that the counterparty could still
+/// treat as a locked payment.
+#[test]
+fn a_zero_amount_payment_is_rejected() {
+    let mut ctx = setup();
+    let receiver = ctx.receiver.pubkey();
+
+    assert_eq!(ctx.pay_with(receiver, 0).unwrap_err().code(), E_ZERO_AMOUNT);
+}
+
+/// Paying yourself is not a swap, and it would let someone create a payment nobody else can
+/// resolve while still looking like one to a watcher.
+#[test]
+fn a_payment_to_myself_is_rejected() {
+    let mut ctx = setup();
+    let sender = ctx.sender.pubkey();
+
+    assert_eq!(ctx.pay_with(sender, AMOUNT).unwrap_err().code(), E_INVALID_RECEIVER);
+}
+
+/// The default pubkey has no known private key, so funds sent to it could only ever be refunded.
+#[test]
+fn a_payment_to_the_default_pubkey_is_rejected() {
+    let mut ctx = setup();
+
+    assert_eq!(
+        ctx.pay_with(Pubkey::default(), AMOUNT).unwrap_err().code(),
+        E_INVALID_RECEIVER
+    );
 }

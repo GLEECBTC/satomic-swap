@@ -1487,6 +1487,7 @@ dependencies = [
  "base64 0.22.1",
  "litesvm",
  "satomic-swap",
+ "serde_json",
  "solana-account",
  "solana-clock",
  "solana-instruction",

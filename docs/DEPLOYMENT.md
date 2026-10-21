@@ -1,6 +1,7 @@
 # Deploying satomic-swap
 
-The program is **not deployed anywhere** today. This is the runbook for changing that.
+The program is live on **devnet** only (see the README's status table). This is the runbook for
+deploying it, and for the mainnet deploy still to come.
 
 Program id: `54mDjQz6jS9sggCV1P5GoUzqHaBEueGVZqmaMPLt2tDx`
 

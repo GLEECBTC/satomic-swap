@@ -3,9 +3,9 @@
 An HTLC (hash time-locked contract) program for Solana, used by the Komodo DeFi Framework to
 settle the Solana side of an atomic swap.
 
-> **Not audited. Not deployed.**
-> This program has never been audited and is not live on devnet or mainnet. Do not send it funds
-> you are not prepared to lose. The program id below is reserved but unclaimed.
+> **Not audited. Devnet only.**
+> This program has never been audited. It is live on devnet, for testing, and not on mainnet - where
+> the program id below is reserved but unclaimed. Do not send it funds you are not prepared to lose.
 
 Program id: `54mDjQz6jS9sggCV1P5GoUzqHaBEueGVZqmaMPLt2tDx`
 
@@ -151,9 +151,9 @@ anyone can verify against the audited commit.
 | | |
 |---|---|
 | Audited | No |
-| Deployed to devnet | No |
+| Deployed to devnet | Yes: commit `f0a4a35`, slot 512756155, binary sha256 `31d280dab2599b09877fbb4cdc28e9dfaa4414133beb52a87c123cc71dc2b194` |
 | Deployed to mainnet | No |
-| Upgrade authority | Not yet established |
+| Upgrade authority | Devnet: single key `CfwfUDVVgrtfPx38y8T6aiEmcGpSBK54Cv3z4213vbS4`. Mainnet: not yet established |
 
 The program must be audited, then deployed with a documented upgrade-authority policy, before the
 framework enables Solana trading.

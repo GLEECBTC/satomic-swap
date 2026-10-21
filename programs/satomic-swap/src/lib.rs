@@ -164,8 +164,6 @@ pub mod satomic_swap {
             SwapError::InvalidReceiver
         );
 
-        require_no_transfer_fee(&ctx.accounts.mint.to_account_info())?;
-
         ctx.accounts.payment.bump = ctx.bumps.payment;
 
         transfer_checked(
@@ -328,35 +326,34 @@ fn require_lock_time_expired(lock_time: u64) -> Result<()> {
     Ok(())
 }
 
-/// Rejects mints that can charge a transfer fee.
+/// Whether this mint is safe to lock: it must not charge a transfer fee, nor be able to start.
 ///
 /// With a fee, the vault receives less than `amount`, so either the receiver is short-changed or the
 /// sender has to over-send — neither is something a swap can silently absorb. The fee is also
 /// mutable: `TransferFeeConfig` carries an older and a newer fee plus an authority that can raise
 /// it, so a mint that is fee-free today can charge one tomorrow.
 ///
-/// This is deliberately checked **only when the payment is made**. Re-checking on spend or refund
-/// would let a fee authority trap funds mid-swap by adding a fee after the payment was locked.
-fn require_no_transfer_fee(mint: &AccountInfo) -> Result<()> {
-    let data = mint.try_borrow_data()?;
+/// Used as a constraint on the mint in [`SplPayment`], which runs before the vault is created, so a
+/// rejected mint costs nothing. It is deliberately applied **only when the payment is made**:
+/// re-checking on spend or refund would let a fee authority trap funds mid-swap.
+pub fn mint_has_no_transfer_fee(mint: &AccountInfo) -> bool {
+    let Ok(data) = mint.try_borrow_data() else {
+        return false;
+    };
     // Classic SPL Token mints carry no extensions, so this either fails to parse as an extended
     // mint or simply reports no transfer fee config. Both are fine.
     let Ok(state) = PodStateWithExtensions::<PodMint>::unpack(&data) else {
-        return Ok(());
+        return true;
     };
     let Ok(config) = state.get_extension::<TransferFeeConfig>() else {
-        return Ok(());
+        return true;
     };
 
     let newer = u16::from(config.newer_transfer_fee.transfer_fee_basis_points);
     let older = u16::from(config.older_transfer_fee.transfer_fee_basis_points);
     let mutable = Option::<Pubkey>::from(config.transfer_fee_config_authority).is_some();
-    require!(
-        newer == 0 && older == 0 && !mutable,
-        SwapError::TransferFeeNotSupported
-    );
 
-    Ok(())
+    newer == 0 && older == 0 && !mutable
 }
 
 #[derive(Accounts)]
@@ -438,6 +435,7 @@ pub struct SplPayment<'info> {
     pub sender: Signer<'info>,
     /// CHECK: only its key matters; bound into the PDA seeds.
     pub receiver: UncheckedAccount<'info>,
+    #[account(constraint = mint_has_no_transfer_fee(&mint.to_account_info()) @ SwapError::TransferFeeNotSupported)]
     pub mint: InterfaceAccount<'info, Mint>,
     #[account(
         mut,

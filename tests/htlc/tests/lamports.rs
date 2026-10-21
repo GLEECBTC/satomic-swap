@@ -142,6 +142,9 @@ impl Ctx {
         let mut clock: Clock = self.svm.get_sysvar();
         clock.unix_timestamp = LOCK_TIME as i64 + 1;
         self.svm.set_sysvar(&clock);
+        // Time moving forward means a new blockhash; without this a retried instruction is
+        // byte-identical to the earlier one and gets rejected as AlreadyProcessed.
+        self.svm.expire_blockhash();
     }
 }
 

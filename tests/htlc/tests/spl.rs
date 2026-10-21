@@ -1,6 +1,7 @@
 //! HTLC tests for the SPL / Token-2022 path, including the transfer-fee rejection.
 
 use anchor_lang::{InstructionData, ToAccountMetas};
+use litesvm::types::TransactionMetadata;
 use litesvm::LiteSVM;
 use solana_account::Account as SolanaAccount;
 use solana_clock::Clock;
@@ -14,6 +15,10 @@ use spl_token_2022_interface::extension::transfer_fee::instruction::initialize_t
 use spl_token_2022_interface::extension::ExtensionType;
 use spl_token_2022_interface::instruction::initialize_mint2;
 use spl_token_2022_interface::state::{Account as TokenAccountState, AccountState, Mint as MintState};
+
+mod common;
+use common::{custom_code, expect_event};
+use satomic_swap::events::{PaymentRefunded, PaymentSent, PaymentSpent};
 
 const PROGRAM_ID: Pubkey = satomic_swap::ID;
 const ATA_PROGRAM: Pubkey = pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
@@ -138,15 +143,6 @@ fn setup(token_program: Pubkey, fee_bps: Option<u16>) -> Ctx {
     Ctx { svm, sender, receiver, mint, token_program, secret, secret_hash }
 }
 
-fn custom_code(rendered: &str) -> u32 {
-    rendered
-        .split("Custom(")
-        .nth(1)
-        .and_then(|rest| rest.split(')').next())
-        .and_then(|n| n.trim().parse().ok())
-        .unwrap_or(0)
-}
-
 impl Ctx {
     fn payment_pda(&self) -> Pubkey {
         Pubkey::find_program_address(
@@ -164,15 +160,30 @@ impl Ctx {
         .0
     }
 
-    fn send(&mut self, ix: Instruction, signer: &Keypair) -> Result<(), u32> {
+    fn send(&mut self, ix: Instruction, signer: &Keypair) -> Result<TransactionMetadata, u32> {
+        self.send_signed_by(ix, signer, signer)
+    }
+
+    /// Sends `ix` with `signer` as the authority but `payer` covering the fee, so a test can make
+    /// one party attempt another party's instruction.
+    fn send_signed_by(
+        &mut self,
+        ix: Instruction,
+        payer: &Keypair,
+        signer: &Keypair,
+    ) -> Result<TransactionMetadata, u32> {
+        let mut signers = vec![payer];
+        if signer.pubkey() != payer.pubkey() {
+            signers.push(signer);
+        }
         let tx = Transaction::new_signed_with_payer(
             &[ix],
-            Some(&signer.pubkey()),
-            &[signer],
+            Some(&payer.pubkey()),
+            &signers,
             self.svm.latest_blockhash(),
         );
         match self.svm.send_transaction(tx) {
-            Ok(_) => Ok(()),
+            Ok(meta) => Ok(meta),
             Err(failed) => {
                 let rendered = format!("{:?}", failed.err);
                 if std::env::var("DUMP_ERR").is_ok() {
@@ -183,7 +194,7 @@ impl Ctx {
         }
     }
 
-    fn pay(&mut self) -> Result<Pubkey, u32> {
+    fn pay(&mut self) -> Result<(Pubkey, TransactionMetadata), u32> {
         let payment = self.payment_pda();
         let ix = Instruction {
             program_id: PROGRAM_ID,
@@ -207,10 +218,10 @@ impl Ctx {
             .data(),
         };
         let sender = self.sender.insecure_clone();
-        self.send(ix, &sender).map(|_| payment)
+        self.send(ix, &sender).map(|meta| (payment, meta))
     }
 
-    fn spend(&mut self, payment: Pubkey, secret: [u8; 32]) -> Result<(), u32> {
+    fn spend(&mut self, payment: Pubkey, secret: [u8; 32]) -> Result<TransactionMetadata, u32> {
         let ix = Instruction {
             program_id: PROGRAM_ID,
             accounts: satomic_swap::accounts::ReceiverSpendSpl {
@@ -235,7 +246,7 @@ impl Ctx {
         self.send(ix, &receiver)
     }
 
-    fn refund(&mut self, payment: Pubkey) -> Result<(), u32> {
+    fn refund(&mut self, payment: Pubkey) -> Result<TransactionMetadata, u32> {
         let ix = Instruction {
             program_id: PROGRAM_ID,
             accounts: satomic_swap::accounts::SenderRefundSpl {
@@ -280,13 +291,31 @@ fn spl_payment_locks_tokens_and_the_receiver_can_claim_them() {
     let sender_ata = ata(&ctx.sender.pubkey(), &ctx.mint, &SPL_TOKEN);
     let receiver_ata = ata(&ctx.receiver.pubkey(), &ctx.mint, &SPL_TOKEN);
 
-    let payment = ctx.pay().expect("payment should succeed");
+    let (payment, meta) = ctx.pay().expect("payment should succeed");
     let vault = ata(&payment, &ctx.mint, &SPL_TOKEN);
+
+    // The framework finds payments by these events, since the account is closed once settled.
+    let sent: PaymentSent = expect_event(&meta.logs);
+    assert_eq!(sent.payment, payment);
+    assert_eq!(sent.sender, ctx.sender.pubkey());
+    assert_eq!(sent.receiver, ctx.receiver.pubkey());
+    assert_eq!(sent.mint, Some(ctx.mint), "an SPL payment must name its mint");
+    assert_eq!(sent.amount, AMOUNT);
+    assert_eq!(sent.lock_time, LOCK_TIME);
+    assert_eq!(sent.secret_hash, ctx.secret_hash);
 
     assert_eq!(ctx.token_balance(&sender_ata), BALANCE - AMOUNT, "tokens left the sender");
     assert_eq!(ctx.token_balance(&vault), AMOUNT, "tokens are held by the vault");
 
-    ctx.spend(payment, ctx.secret).expect("spend should succeed");
+    let meta = ctx.spend(payment, ctx.secret).expect("spend should succeed");
+
+    // The counterparty claims the other side of the swap with this secret, so it has to be the
+    // real preimage rather than whatever was passed in.
+    let spent: PaymentSpent = expect_event(&meta.logs);
+    assert_eq!(spent.payment, payment);
+    assert_eq!(spent.receiver, ctx.receiver.pubkey());
+    assert_eq!(spent.amount, AMOUNT);
+    assert_eq!(spent.secret, ctx.secret);
 
     assert_eq!(ctx.token_balance(&receiver_ata), AMOUNT, "receiver got the tokens");
     assert!(ctx.svm.get_account(&vault).map(|a| a.data.is_empty()).unwrap_or(true), "vault should be closed");
@@ -297,20 +326,30 @@ fn spl_payment_locks_tokens_and_the_receiver_can_claim_them() {
 fn spl_refund_is_gated_by_the_lock_time() {
     let mut ctx = setup(SPL_TOKEN, None);
     let sender_ata = ata(&ctx.sender.pubkey(), &ctx.mint, &SPL_TOKEN);
-    let payment = ctx.pay().expect("payment should succeed");
+    let (payment, _) = ctx.pay().expect("payment should succeed");
 
-    assert_eq!(ctx.refund(payment), Err(E_LOCK_TIME_NOT_EXPIRED), "refund must wait for expiry");
+    assert_eq!(
+        ctx.refund(payment).err(),
+        Some(E_LOCK_TIME_NOT_EXPIRED),
+        "refund must wait for expiry"
+    );
 
     ctx.warp_past_lock_time();
-    ctx.refund(payment).expect("refund should succeed after expiry");
+    let meta = ctx.refund(payment).expect("refund should succeed after expiry");
+
+    let refunded: PaymentRefunded = expect_event(&meta.logs);
+    assert_eq!(refunded.payment, payment);
+    assert_eq!(refunded.sender, ctx.sender.pubkey());
+    assert_eq!(refunded.amount, AMOUNT);
+
     assert_eq!(ctx.token_balance(&sender_ata), BALANCE, "sender got every token back");
 }
 
 #[test]
 fn spl_spend_with_the_wrong_secret_is_rejected() {
     let mut ctx = setup(SPL_TOKEN, None);
-    let payment = ctx.pay().expect("payment should succeed");
-    assert_eq!(ctx.spend(payment, [8u8; 32]), Err(E_INVALID_SECRET));
+    let (payment, _) = ctx.pay().expect("payment should succeed");
+    assert_eq!(ctx.spend(payment, [8u8; 32]).err(), Some(E_INVALID_SECRET));
 }
 
 #[test]
@@ -318,7 +357,7 @@ fn token_2022_mint_without_a_fee_works() {
     let mut ctx = setup(TOKEN_2022, None);
     let receiver_ata = ata(&ctx.receiver.pubkey(), &ctx.mint, &TOKEN_2022);
 
-    let payment = ctx.pay().expect("a plain Token-2022 mint should be accepted");
+    let (payment, _) = ctx.pay().expect("a plain Token-2022 mint should be accepted");
     ctx.spend(payment, ctx.secret).expect("spend should succeed");
     assert_eq!(ctx.token_balance(&receiver_ata), AMOUNT);
 }
@@ -327,8 +366,8 @@ fn token_2022_mint_without_a_fee_works() {
 fn a_mint_that_charges_a_transfer_fee_is_rejected() {
     let mut ctx = setup(TOKEN_2022, Some(250));
     assert_eq!(
-        ctx.pay(),
-        Err(E_TRANSFER_FEE_NOT_SUPPORTED),
+        ctx.pay().err(),
+        Some(E_TRANSFER_FEE_NOT_SUPPORTED),
         "a fee would leave the vault short of the agreed amount"
     );
 }
@@ -337,5 +376,5 @@ fn a_mint_that_charges_a_transfer_fee_is_rejected() {
 fn a_fee_free_mint_that_could_still_add_one_is_rejected() {
     // Zero fee today, but the config authority can raise it before the payment is claimed.
     let mut ctx = setup(TOKEN_2022, Some(0));
-    assert_eq!(ctx.pay(), Err(E_TRANSFER_FEE_NOT_SUPPORTED));
+    assert_eq!(ctx.pay().err(), Some(E_TRANSFER_FEE_NOT_SUPPORTED));
 }

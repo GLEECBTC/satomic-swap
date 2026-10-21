@@ -4,6 +4,7 @@
 //! with the wrong secret, and substituting parameters that the PDA is supposed to bind.
 
 use anchor_lang::{InstructionData, ToAccountMetas};
+use litesvm::types::TransactionMetadata;
 use litesvm::LiteSVM;
 use solana_clock::Clock;
 use solana_instruction::Instruction;
@@ -11,6 +12,10 @@ use solana_keypair::Keypair;
 use solana_pubkey::Pubkey;
 use solana_signer::Signer;
 use solana_transaction::Transaction;
+
+mod common;
+use common::{custom_code, expect_event};
+use satomic_swap::events::{PaymentRefunded, PaymentSent, PaymentSpent};
 
 const PROGRAM_ID: Pubkey = satomic_swap::ID;
 const AMOUNT: u64 = 2_000_000_000;
@@ -60,20 +65,37 @@ fn payment_pda(sender: &Pubkey, receiver: &Pubkey, secret_hash: &[u8; 32], amoun
 }
 
 impl Ctx {
-    fn send(&mut self, ix: Instruction, signer: &Keypair) -> Result<(), u32> {
+    fn send(&mut self, ix: Instruction, signer: &Keypair) -> Result<TransactionMetadata, u32> {
+        self.send_signed_by(ix, signer, signer)
+    }
+
+    /// Sends `ix` with `signer` as the authority but `payer` covering the fee, so a test can make
+    /// one party attempt another party's instruction.
+    fn send_signed_by(
+        &mut self,
+        ix: Instruction,
+        payer: &Keypair,
+        signer: &Keypair,
+    ) -> Result<TransactionMetadata, u32> {
+        let mut signers = vec![payer];
+        if signer.pubkey() != payer.pubkey() {
+            signers.push(signer);
+        }
         let tx = Transaction::new_signed_with_payer(
             &[ix],
-            Some(&signer.pubkey()),
-            &[signer],
+            Some(&payer.pubkey()),
+            &signers,
             self.svm.latest_blockhash(),
         );
         match self.svm.send_transaction(tx) {
-            Ok(_) => Ok(()),
+            Ok(meta) => Ok(meta),
             Err(failed) => Err(custom_code(&format!("{:?}", failed.err))),
         }
     }
 
-    fn pay(&mut self) -> Pubkey {
+    fn pay(&mut self) -> Pubkey { self.pay_with_logs().0 }
+
+    fn pay_with_logs(&mut self) -> (Pubkey, TransactionMetadata) {
         let payment = payment_pda(
             &self.sender.pubkey(),
             &self.receiver.pubkey(),
@@ -97,8 +119,8 @@ impl Ctx {
             .data(),
         };
         let sender = self.sender.insecure_clone();
-        self.send(ix, &sender).expect("payment should succeed");
-        payment
+        let meta = self.send(ix, &sender).expect("payment should succeed");
+        (payment, meta)
     }
 
     fn spend_ix(&self, payment: Pubkey, secret: [u8; 32], amount: u64) -> Instruction {
@@ -148,21 +170,21 @@ impl Ctx {
     }
 }
 
-/// Pulls the `Custom(n)` code out of a formatted transaction error, or 0 if it isn't one.
-fn custom_code(rendered: &str) -> u32 {
-    rendered
-        .split("Custom(")
-        .nth(1)
-        .and_then(|rest| rest.split(')').next())
-        .and_then(|n| n.trim().parse().ok())
-        .unwrap_or(0)
-}
-
 #[test]
 fn receiver_can_spend_with_the_secret_and_rent_returns_to_the_sender() {
     let mut ctx = setup();
     let sender_before = ctx.svm.get_balance(&ctx.sender.pubkey()).unwrap();
-    let payment = ctx.pay();
+    let (payment, meta) = ctx.pay_with_logs();
+
+    // The framework finds payments by these events, since the account is closed once settled.
+    let sent: PaymentSent = expect_event(&meta.logs);
+    assert_eq!(sent.payment, payment);
+    assert_eq!(sent.sender, ctx.sender.pubkey());
+    assert_eq!(sent.receiver, ctx.receiver.pubkey());
+    assert_eq!(sent.mint, None, "a lamports payment has no mint");
+    assert_eq!(sent.amount, AMOUNT);
+    assert_eq!(sent.lock_time, LOCK_TIME);
+    assert_eq!(sent.secret_hash, ctx.secret_hash);
 
     // The payment holds the amount plus its own rent.
     let locked = ctx.svm.get_balance(&payment).unwrap();
@@ -171,7 +193,15 @@ fn receiver_can_spend_with_the_secret_and_rent_returns_to_the_sender() {
     let receiver_before = ctx.svm.get_balance(&ctx.receiver.pubkey()).unwrap();
     let ix = ctx.spend_ix(payment, ctx.secret, AMOUNT);
     let receiver = ctx.receiver.insecure_clone();
-    ctx.send(ix, &receiver).expect("spend should succeed");
+    let meta = ctx.send(ix, &receiver).expect("spend should succeed");
+
+    // The counterparty claims the other side of the swap with this secret, so it has to be the
+    // real preimage rather than whatever was passed in.
+    let spent: PaymentSpent = expect_event(&meta.logs);
+    assert_eq!(spent.payment, payment);
+    assert_eq!(spent.receiver, ctx.receiver.pubkey());
+    assert_eq!(spent.amount, AMOUNT);
+    assert_eq!(spent.secret, ctx.secret);
 
     let receiver_after = ctx.svm.get_balance(&ctx.receiver.pubkey()).unwrap();
     // The receiver pays the transaction fee, so it nets the amount minus that fee.
@@ -195,8 +225,8 @@ fn refund_before_lock_time_is_rejected() {
     let ix = ctx.refund_ix(payment);
     let sender = ctx.sender.insecure_clone();
     assert_eq!(
-        ctx.send(ix, &sender),
-        Err(E_LOCK_TIME_NOT_EXPIRED),
+        ctx.send(ix, &sender).err(),
+        Some(E_LOCK_TIME_NOT_EXPIRED),
         "the original program allowed this, which broke atomicity"
     );
     assert!(ctx.svm.get_balance(&payment).unwrap() > AMOUNT, "funds stay locked");
@@ -211,7 +241,12 @@ fn refund_after_lock_time_returns_everything_to_the_sender() {
 
     let ix = ctx.refund_ix(payment);
     let sender = ctx.sender.insecure_clone();
-    ctx.send(ix, &sender).expect("refund should succeed after expiry");
+    let meta = ctx.send(ix, &sender).expect("refund should succeed after expiry");
+
+    let refunded: PaymentRefunded = expect_event(&meta.logs);
+    assert_eq!(refunded.payment, payment);
+    assert_eq!(refunded.sender, ctx.sender.pubkey());
+    assert_eq!(refunded.amount, AMOUNT);
 
     assert_eq!(ctx.svm.get_balance(&payment).unwrap_or(0), 0, "payment account should be closed");
     let sender_after = ctx.svm.get_balance(&ctx.sender.pubkey()).unwrap();
@@ -225,7 +260,7 @@ fn spending_with_the_wrong_secret_is_rejected() {
 
     let ix = ctx.spend_ix(payment, [9u8; 32], AMOUNT);
     let receiver = ctx.receiver.insecure_clone();
-    assert_eq!(ctx.send(ix, &receiver), Err(E_INVALID_SECRET));
+    assert_eq!(ctx.send(ix, &receiver).err(), Some(E_INVALID_SECRET));
 }
 
 #[test]

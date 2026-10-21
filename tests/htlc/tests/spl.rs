@@ -590,7 +590,8 @@ fn a_fee_free_mint_that_could_still_add_one_is_rejected() {
 
 // --- Authorization ---
 //
-// The same gap as on the lamports path: knowing the secret must not be enough to move the funds.
+// The same policy as on the lamports path, for the same reason: the seeds decide where the tokens
+// go, and the signer checks decide who may act.
 
 #[test]
 fn a_third_party_who_knows_the_secret_cannot_spend_spl() {

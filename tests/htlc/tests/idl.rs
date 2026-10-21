@@ -85,7 +85,7 @@ fn instruction_discriminators_match_the_program() {
     }
 }
 
-/// The framework's watcher classifies a payment's fate by the event it emitted, so these are just
+/// The framework classifies a payment's fate by the event it emitted, so these are just
 /// as load-bearing as the instruction discriminators.
 #[test]
 fn event_discriminators_match_the_program() {

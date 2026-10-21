@@ -44,6 +44,21 @@ integrating: a settled payment's account no longer exists, so a client that look
 and finds nothing must not conclude the payment was never made. Use the events, or
 `getSignaturesForAddress` on the PDA, to tell "never sent" from "already settled".
 
+## Who can act
+
+Theft is prevented by the PDA seeds, not by signatures: a spend always pays the receiver named in
+the seeds, and a refund always pays the sender. A third party who executed either could only
+deliver the funds to their rightful owner.
+
+On top of that, each instruction requires the party it belongs to: only the receiver may spend, and
+only the sender may refund. That rule is a deliberate policy rather than a security necessity. The
+Komodo DeFi Framework runs no watchers for Solana swaps, so no third party ever needs to act on a
+user's behalf, and keeping the set of actors to the two parties means nobody else can, for example,
+refund a payment out from under a receiver claiming late.
+
+Watcher support would mean relaxing this — any signer, seed-bound destinations — and would need
+re-auditing.
+
 ## Events
 
 The three events are the only durable record once an account is closed, so integrations should

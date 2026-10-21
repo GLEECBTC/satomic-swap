@@ -391,8 +391,17 @@ fn a_payment_cannot_be_spent_twice() {
 
 // --- Authorization ---
 //
-// Everything above tests the *secret*. These test the *signer*: knowing the secret must not be
-// enough, or a watcher that learns it from a spend on the other chain could take these funds too.
+// Everything above tests the *secret*. These test the *signer*.
+//
+// They pin a policy, not a theft protection. Theft is already impossible without them: the PDA
+// seeds bind where the funds go - a spend always pays the receiver, a refund always pays the
+// sender - so a third party executing either could only deliver the funds to their rightful owner.
+// `a_third_party_substituting_itself_as_receiver_finds_no_payment` is the test for that.
+//
+// What the signer checks add is that only the parties act: the receiver spends, the sender refunds,
+// and nobody does either on their behalf. KDF runs no watchers for Solana, so no third party ever
+// needs to. Relaxing this - any signer, seed-bound destinations - is how watcher support would be
+// added if that changes, and it would need re-auditing.
 
 #[test]
 fn a_third_party_who_knows_the_secret_cannot_spend() {
@@ -460,8 +469,8 @@ fn the_sender_cannot_spend_its_own_payment() {
     let mut ctx = setup();
     let payment = ctx.pay();
 
-    // The maker picks the secret, so it knows it: the signer check is the only thing keeping it
-    // from taking its own payment back before the lock time.
+    // The maker picks the secret, so it knows it. A spend would still pay the receiver - the seeds
+    // see to that - but spending is the receiver's action, not the sender's.
     let ix = ctx.spend_ix(payment, ctx.secret, AMOUNT);
     let sender = ctx.sender.insecure_clone();
     let failure = ctx
@@ -484,8 +493,8 @@ fn the_receiver_cannot_refund_even_after_expiry() {
     let payment = ctx.pay();
     ctx.warp_past_lock_time();
 
-    // Expiry entitles the *sender* to a refund. If the receiver could trigger it, the refund would
-    // still pay the sender, but the receiver could grief a swap it no longer wants to complete.
+    // Expiry entitles the *sender* to a refund, and the seeds make the refund pay the sender
+    // whoever sends it. Refunding is still the sender's action to take, not the receiver's.
     let ix = ctx.refund_ix(payment);
     let receiver = ctx.receiver.insecure_clone();
     let failure = ctx
@@ -510,6 +519,8 @@ fn a_third_party_cannot_refund_after_expiry() {
     let attacker = Keypair::new();
     ctx.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
 
+    // The lock time gates only the refund, so after expiry the receiver can still claim with the
+    // secret. A third party able to refund could close the payment out from under a late claim.
     let ix = ctx.refund_ix(payment);
     let failure = ctx
         .send_without_all_signatures(ix, &attacker)
@@ -557,7 +568,7 @@ fn a_zero_amount_payment_is_rejected() {
 }
 
 /// Paying yourself is not a swap, and it would let someone create a payment nobody else can
-/// resolve while still looking like one to a watcher.
+/// resolve while still looking like one to anyone reading the chain.
 #[test]
 fn a_payment_to_myself_is_rejected() {
     let mut ctx = setup();

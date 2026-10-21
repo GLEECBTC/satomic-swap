@@ -59,7 +59,7 @@ pub fn decode_events<E: AnchorDeserialize + Discriminator>(logs: &[String]) -> V
 /// The single event of type `E` the transaction emitted.
 ///
 /// Panics if there is none, or more than one: a swap instruction that emitted its event twice would
-/// be as wrong as one that emitted none, and the framework's watcher reads these to find payments.
+/// be as wrong as one that emitted none, and the framework reads these to find payments.
 pub fn expect_event<E: AnchorDeserialize + Discriminator>(logs: &[String]) -> E {
     let mut events = decode_events::<E>(logs);
     assert_eq!(

@@ -1,6 +1,6 @@
 use anchor_lang::prelude::*;
 
-/// Emitted when funds are locked. Indexers (and the Komodo DeFi Framework's swap watcher) use these
+/// Emitted when funds are locked. Indexers and the Komodo DeFi Framework use these
 /// to find payments and their outcomes, since the payment account is closed once it is settled.
 #[event]
 pub struct PaymentSent {

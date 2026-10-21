@@ -1,0 +1,25 @@
+[package]
+name = "satomic-swap"
+version = "0.2.0"
+edition = "2021"
+description = "HTLC atomic swap program for Solana, used by the Komodo DeFi Framework"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "satomic_swap"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = "1.2.0"
+anchor-spl = { version = "1.2.0", features = ["token_2022"] }
+# SHA-256 for the HTLC secret. Anchor 1.x's `solana_program` shim no longer re-exports `hash`.
+solana-sha256-hasher = "3.1"
+

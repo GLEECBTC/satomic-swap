@@ -17,7 +17,7 @@ use spl_token_2022_interface::instruction::initialize_mint2;
 use spl_token_2022_interface::state::{Account as TokenAccountState, AccountState, Mint as MintState};
 
 mod common;
-use common::{expect_event, TxFailure};
+use common::{assert_compute_units, cu, expect_event, TxFailure};
 use satomic_swap::events::{PaymentRefunded, PaymentSent, PaymentSpent};
 
 const PROGRAM_ID: Pubkey = satomic_swap::ID;
@@ -583,4 +583,33 @@ fn an_spl_payment_to_the_default_pubkey_is_rejected() {
         ctx.pay_with(Pubkey::default(), AMOUNT).unwrap_err().code(),
         E_INVALID_RECEIVER
     );
+}
+
+/// Pins what each instruction costs, on both token programs: Token-2022's extension handling makes
+/// a spend noticeably more expensive than classic SPL Token, and the limit KDF requests has to
+/// cover whichever mint a swap actually uses.
+#[test]
+fn spl_instructions_stay_within_their_compute_budget() {
+    for token_program in [SPL_TOKEN, TOKEN_2022] {
+        let mut ctx = setup(token_program, None);
+        let (payment, meta) = ctx.pay().expect("payment should succeed");
+        assert_compute_units("spl_payment", meta.compute_units_consumed, cu::SPL_PAYMENT);
+
+        let meta = ctx.spend(payment, ctx.secret).expect("spend should succeed");
+        assert_compute_units(
+            "receiver_spend_spl",
+            meta.compute_units_consumed,
+            cu::RECEIVER_SPEND_SPL,
+        );
+
+        let mut ctx = setup(token_program, None);
+        let (payment, _) = ctx.pay().expect("payment should succeed");
+        ctx.warp_past_lock_time();
+        let meta = ctx.refund(payment).expect("refund should succeed");
+        assert_compute_units(
+            "sender_refund_spl",
+            meta.compute_units_consumed,
+            cu::SENDER_REFUND_SPL,
+        );
+    }
 }

@@ -14,7 +14,7 @@ use solana_signer::Signer;
 use solana_transaction::Transaction;
 
 mod common;
-use common::{expect_event, TxFailure};
+use common::{assert_compute_units, cu, expect_event, TxFailure};
 use satomic_swap::events::{PaymentRefunded, PaymentSent, PaymentSpent};
 
 const PROGRAM_ID: Pubkey = satomic_swap::ID;
@@ -477,5 +477,35 @@ fn a_payment_to_the_default_pubkey_is_rejected() {
     assert_eq!(
         ctx.pay_with(Pubkey::default(), AMOUNT).unwrap_err().code(),
         E_INVALID_RECEIVER
+    );
+}
+
+/// Pins what each instruction costs, so KDF can request a compute limit that is neither too small
+/// to succeed nor so large that the priority fee is wasted.
+#[test]
+fn lamports_instructions_stay_within_their_compute_budget() {
+    let mut ctx = setup();
+    let (payment, meta) = ctx.pay_with_logs();
+    assert_compute_units("lamports_payment", meta.compute_units_consumed, cu::LAMPORTS_PAYMENT);
+
+    let ix = ctx.spend_ix(payment, ctx.secret, AMOUNT);
+    let receiver = ctx.receiver.insecure_clone();
+    let meta = ctx.send(ix, &receiver).expect("spend should succeed");
+    assert_compute_units(
+        "receiver_spend_lamports",
+        meta.compute_units_consumed,
+        cu::RECEIVER_SPEND_LAMPORTS,
+    );
+
+    let mut ctx = setup();
+    let payment = ctx.pay();
+    ctx.warp_past_lock_time();
+    let ix = ctx.refund_ix(payment);
+    let sender = ctx.sender.insecure_clone();
+    let meta = ctx.send(ix, &sender).expect("refund should succeed");
+    assert_compute_units(
+        "sender_refund_lamports",
+        meta.compute_units_consumed,
+        cu::SENDER_REFUND_LAMPORTS,
     );
 }

@@ -1,4 +1,8 @@
 //! Helpers shared by the lamports and SPL test binaries.
+//!
+//! Cargo compiles this module separately into each test binary, and each one uses a different
+//! subset of it, so anything the other binary uses looks dead from here.
+#![allow(dead_code)]
 
 use anchor_lang::{AnchorDeserialize, Discriminator};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -65,4 +69,44 @@ pub fn expect_event<E: AnchorDeserialize + Discriminator>(logs: &[String]) -> E 
     );
 
     events.remove(0)
+}
+
+/// Compute units each instruction must stay under.
+///
+/// These exist so KDF can set `SetComputeUnitLimit` deliberately. The limit matters in both
+/// directions: a transaction that requests fewer units than it uses fails outright, while one that
+/// requests far more overpays, because a priority fee is charged per *requested* unit rather than
+/// per consumed unit.
+///
+/// Measured on LiteSVM, with the Token-2022 figure in brackets where it differs:
+///
+/// | instruction               | consumed          |
+/// |---------------------------|-------------------|
+/// | `lamports_payment`        |  8_349            |
+/// | `receiver_spend_lamports` |  4_888            |
+/// | `sender_refund_lamports`  |  4_098            |
+/// | `spl_payment`             | 37_424 [34_567]   |
+/// | `receiver_spend_spl`      | 13_134 [16_405]   |
+/// | `sender_refund_spl`       | 13_084            |
+///
+/// The ceilings sit well above those so a toolchain bump doesn't break CI, but close enough that a
+/// real regression - an added CPI, a loop over accounts - does.
+pub mod cu {
+    pub const LAMPORTS_PAYMENT: u64 = 12_000;
+    pub const RECEIVER_SPEND_LAMPORTS: u64 = 8_000;
+    pub const SENDER_REFUND_LAMPORTS: u64 = 8_000;
+    pub const SPL_PAYMENT: u64 = 50_000;
+    /// Covers Token-2022, which costs more than classic SPL Token here.
+    pub const RECEIVER_SPEND_SPL: u64 = 25_000;
+    pub const SENDER_REFUND_SPL: u64 = 25_000;
+}
+
+/// Asserts an instruction stayed under its ceiling, and that it actually ran.
+pub fn assert_compute_units(name: &str, consumed: u64, ceiling: u64) {
+    assert!(consumed > 0, "{name} consumed no compute units, so it cannot have executed");
+    assert!(
+        consumed <= ceiling,
+        "{name} consumed {consumed} compute units, over its {ceiling} ceiling. If this is a \
+         deliberate cost increase, raise the ceiling here and the limit KDF requests."
+    );
 }

@@ -48,7 +48,13 @@ fn setup() -> Ctx {
     let secret = [7u8; 32];
     let secret_hash = solana_sha256_hasher::hash(&secret).to_bytes();
 
-    Ctx { svm, sender, receiver, secret, secret_hash }
+    Ctx {
+        svm,
+        sender,
+        receiver,
+        secret,
+        secret_hash,
+    }
 }
 
 fn payment_pda(sender: &Pubkey, receiver: &Pubkey, secret_hash: &[u8; 32], amount: u64) -> Pubkey {
@@ -67,7 +73,11 @@ fn payment_pda(sender: &Pubkey, receiver: &Pubkey, secret_hash: &[u8; 32], amoun
 }
 
 impl Ctx {
-    fn send(&mut self, ix: Instruction, signer: &Keypair) -> Result<TransactionMetadata, TxFailure> {
+    fn send(
+        &mut self,
+        ix: Instruction,
+        signer: &Keypair,
+    ) -> Result<TransactionMetadata, TxFailure> {
         self.send_signed_by(ix, signer, signer)
     }
 
@@ -95,7 +105,9 @@ impl Ctx {
         }
     }
 
-    fn pay(&mut self) -> Pubkey { self.pay_with_logs().0 }
+    fn pay(&mut self) -> Pubkey {
+        self.pay_with_logs().0
+    }
 
     fn pay_with_logs(&mut self) -> (Pubkey, TransactionMetadata) {
         let payment = payment_pda(
@@ -126,7 +138,11 @@ impl Ctx {
     }
 
     /// A payment with an arbitrary receiver and amount, for the rejection cases.
-    fn pay_with(&mut self, receiver: Pubkey, amount: u64) -> Result<TransactionMetadata, TxFailure> {
+    fn pay_with(
+        &mut self,
+        receiver: Pubkey,
+        amount: u64,
+    ) -> Result<TransactionMetadata, TxFailure> {
         let payment = payment_pda(&self.sender.pubkey(), &receiver, &self.secret_hash, amount);
         let ix = Instruction {
             program_id: PROGRAM_ID,
@@ -188,7 +204,11 @@ impl Ctx {
     /// Sends `ix` paid for and signed only by `payer`, leaving any other required signature
     /// missing. This is what impersonation actually looks like: the attacker names the real
     /// counterparty so the PDA still resolves, and then cannot sign for them.
-    fn send_without_all_signatures(&mut self, ix: Instruction, payer: &Keypair) -> Result<TransactionMetadata, TxFailure> {
+    fn send_without_all_signatures(
+        &mut self,
+        ix: Instruction,
+        payer: &Keypair,
+    ) -> Result<TransactionMetadata, TxFailure> {
         let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
         tx.partial_sign(&[payer], self.svm.latest_blockhash());
         match self.svm.send_transaction(tx) {
@@ -242,16 +262,35 @@ fn receiver_can_spend_with_the_secret_and_rent_returns_to_the_sender() {
 
     let receiver_after = ctx.svm.get_balance(&ctx.receiver.pubkey()).unwrap();
     // The receiver pays the transaction fee, so it nets the amount minus that fee.
-    assert!(receiver_after > receiver_before, "receiver received the locked amount");
-    assert!(receiver_after - receiver_before <= AMOUNT, "receiver cannot receive more than the amount");
-    assert!(AMOUNT - (receiver_after - receiver_before) < 100_000, "only fees were deducted");
+    assert!(
+        receiver_after > receiver_before,
+        "receiver received the locked amount"
+    );
+    assert!(
+        receiver_after - receiver_before <= AMOUNT,
+        "receiver cannot receive more than the amount"
+    );
+    assert!(
+        AMOUNT - (receiver_after - receiver_before) < 100_000,
+        "only fees were deducted"
+    );
 
     // The payment account is gone and its rent went back to the sender, so the sender is only out
     // the swap amount plus fees.
-    assert_eq!(ctx.svm.get_balance(&payment).unwrap_or(0), 0, "payment account should be closed");
+    assert_eq!(
+        ctx.svm.get_balance(&payment).unwrap_or(0),
+        0,
+        "payment account should be closed"
+    );
     let sender_after = ctx.svm.get_balance(&ctx.sender.pubkey()).unwrap();
-    assert!(sender_before - sender_after >= AMOUNT, "sender paid at least the amount");
-    assert!(sender_before - sender_after < AMOUNT + 100_000, "sender got the rent back");
+    assert!(
+        sender_before - sender_after >= AMOUNT,
+        "sender paid at least the amount"
+    );
+    assert!(
+        sender_before - sender_after < AMOUNT + 100_000,
+        "sender got the rent back"
+    );
 }
 
 #[test]
@@ -266,7 +305,10 @@ fn refund_before_lock_time_is_rejected() {
         E_LOCK_TIME_NOT_EXPIRED,
         "the original program allowed this, which broke atomicity"
     );
-    assert!(ctx.svm.get_balance(&payment).unwrap() > AMOUNT, "funds stay locked");
+    assert!(
+        ctx.svm.get_balance(&payment).unwrap() > AMOUNT,
+        "funds stay locked"
+    );
 }
 
 #[test]
@@ -278,16 +320,25 @@ fn refund_after_lock_time_returns_everything_to_the_sender() {
 
     let ix = ctx.refund_ix(payment);
     let sender = ctx.sender.insecure_clone();
-    let meta = ctx.send(ix, &sender).expect("refund should succeed after expiry");
+    let meta = ctx
+        .send(ix, &sender)
+        .expect("refund should succeed after expiry");
 
     let refunded: PaymentRefunded = expect_event(&meta.logs);
     assert_eq!(refunded.payment, payment);
     assert_eq!(refunded.sender, ctx.sender.pubkey());
     assert_eq!(refunded.amount, AMOUNT);
 
-    assert_eq!(ctx.svm.get_balance(&payment).unwrap_or(0), 0, "payment account should be closed");
+    assert_eq!(
+        ctx.svm.get_balance(&payment).unwrap_or(0),
+        0,
+        "payment account should be closed"
+    );
     let sender_after = ctx.svm.get_balance(&ctx.sender.pubkey()).unwrap();
-    assert!(sender_before - sender_after < 100_000, "sender got amount and rent back, minus fees");
+    assert!(
+        sender_before - sender_after < 100_000,
+        "sender got amount and rent back, minus fees"
+    );
 }
 
 #[test]
@@ -299,7 +350,8 @@ fn spending_with_the_wrong_secret_is_rejected() {
     let receiver = ctx.receiver.insecure_clone();
     assert_eq!(
         ctx.send(ix, &receiver).unwrap_err().code(),
-        E_INVALID_SECRET);
+        E_INVALID_SECRET
+    );
 }
 
 #[test]
@@ -311,8 +363,14 @@ fn claiming_a_different_amount_does_not_resolve_to_the_payment() {
     // account passed in no longer matches.
     let ix = ctx.spend_ix(payment, ctx.secret, AMOUNT * 2);
     let receiver = ctx.receiver.insecure_clone();
-    assert!(ctx.send(ix, &receiver).is_err(), "seed mismatch must be rejected");
-    assert!(ctx.svm.get_balance(&payment).unwrap() > AMOUNT, "funds stay locked");
+    assert!(
+        ctx.send(ix, &receiver).is_err(),
+        "seed mismatch must be rejected"
+    );
+    assert!(
+        ctx.svm.get_balance(&payment).unwrap() > AMOUNT,
+        "funds stay locked"
+    );
 }
 
 #[test]
@@ -325,7 +383,10 @@ fn a_payment_cannot_be_spent_twice() {
     ctx.send(ix, &receiver).expect("first spend should succeed");
 
     let ix = ctx.spend_ix(payment, ctx.secret, AMOUNT);
-    assert!(ctx.send(ix, &receiver).is_err(), "the closed account must not be spendable again");
+    assert!(
+        ctx.send(ix, &receiver).is_err(),
+        "the closed account must not be spendable again"
+    );
 }
 
 // --- Authorization ---
@@ -346,8 +407,14 @@ fn a_third_party_who_knows_the_secret_cannot_spend() {
         .send_without_all_signatures(ix, &attacker)
         .expect_err("a third party must not be able to claim the payment");
 
-    assert!(failure.missing_signature(), "expected a signature failure, got {failure:?}");
-    assert!(ctx.svm.get_balance(&payment).unwrap() > AMOUNT, "funds stay locked");
+    assert!(
+        failure.missing_signature(),
+        "expected a signature failure, got {failure:?}"
+    );
+    assert!(
+        ctx.svm.get_balance(&payment).unwrap() > AMOUNT,
+        "funds stay locked"
+    );
 }
 
 #[test]
@@ -359,7 +426,12 @@ fn a_third_party_substituting_itself_as_receiver_finds_no_payment() {
 
     // The receiver is a PDA seed, so an attacker who signs for itself addresses a payment that was
     // never made rather than the real one.
-    let attacker_payment = payment_pda(&ctx.sender.pubkey(), &attacker.pubkey(), &ctx.secret_hash, AMOUNT);
+    let attacker_payment = payment_pda(
+        &ctx.sender.pubkey(),
+        &attacker.pubkey(),
+        &ctx.secret_hash,
+        AMOUNT,
+    );
     let ix = Instruction {
         program_id: PROGRAM_ID,
         accounts: satomic_swap::accounts::ReceiverSpendLamports {
@@ -377,7 +449,10 @@ fn a_third_party_substituting_itself_as_receiver_finds_no_payment() {
         .data(),
     };
 
-    assert!(ctx.send(ix, &attacker).is_err(), "there is no payment at that address");
+    assert!(
+        ctx.send(ix, &attacker).is_err(),
+        "there is no payment at that address"
+    );
 }
 
 #[test]
@@ -393,8 +468,14 @@ fn the_sender_cannot_spend_its_own_payment() {
         .send_without_all_signatures(ix, &sender)
         .expect_err("the sender must not be able to spend as the receiver");
 
-    assert!(failure.missing_signature(), "expected a signature failure, got {failure:?}");
-    assert!(ctx.svm.get_balance(&payment).unwrap() > AMOUNT, "funds stay locked");
+    assert!(
+        failure.missing_signature(),
+        "expected a signature failure, got {failure:?}"
+    );
+    assert!(
+        ctx.svm.get_balance(&payment).unwrap() > AMOUNT,
+        "funds stay locked"
+    );
 }
 
 #[test]
@@ -411,8 +492,14 @@ fn the_receiver_cannot_refund_even_after_expiry() {
         .send_without_all_signatures(ix, &receiver)
         .expect_err("only the sender may refund");
 
-    assert!(failure.missing_signature(), "expected a signature failure, got {failure:?}");
-    assert!(ctx.svm.get_balance(&payment).unwrap() > AMOUNT, "funds stay locked");
+    assert!(
+        failure.missing_signature(),
+        "expected a signature failure, got {failure:?}"
+    );
+    assert!(
+        ctx.svm.get_balance(&payment).unwrap() > AMOUNT,
+        "funds stay locked"
+    );
 }
 
 #[test]
@@ -428,8 +515,14 @@ fn a_third_party_cannot_refund_after_expiry() {
         .send_without_all_signatures(ix, &attacker)
         .expect_err("a third party must not be able to trigger a refund");
 
-    assert!(failure.missing_signature(), "expected a signature failure, got {failure:?}");
-    assert!(ctx.svm.get_balance(&payment).unwrap() > AMOUNT, "funds stay locked");
+    assert!(
+        failure.missing_signature(),
+        "expected a signature failure, got {failure:?}"
+    );
+    assert!(
+        ctx.svm.get_balance(&payment).unwrap() > AMOUNT,
+        "funds stay locked"
+    );
 }
 
 /// A control for the tests above: the same helper must let a properly signed call through, or
@@ -444,7 +537,11 @@ fn the_partial_signing_helper_still_admits_a_legitimate_spend() {
 
     ctx.send_without_all_signatures(ix, &receiver)
         .expect("the receiver is the only required signer, so this is fully signed");
-    assert_eq!(ctx.svm.get_balance(&payment).unwrap_or(0), 0, "payment was settled");
+    assert_eq!(
+        ctx.svm.get_balance(&payment).unwrap_or(0),
+        0,
+        "payment was settled"
+    );
 }
 
 // --- Payment constraints ---
@@ -466,7 +563,10 @@ fn a_payment_to_myself_is_rejected() {
     let mut ctx = setup();
     let sender = ctx.sender.pubkey();
 
-    assert_eq!(ctx.pay_with(sender, AMOUNT).unwrap_err().code(), E_INVALID_RECEIVER);
+    assert_eq!(
+        ctx.pay_with(sender, AMOUNT).unwrap_err().code(),
+        E_INVALID_RECEIVER
+    );
 }
 
 /// The default pubkey has no known private key, so funds sent to it could only ever be refunded.
@@ -486,7 +586,11 @@ fn a_payment_to_the_default_pubkey_is_rejected() {
 fn lamports_instructions_stay_within_their_compute_budget() {
     let mut ctx = setup();
     let (payment, meta) = ctx.pay_with_logs();
-    assert_compute_units("lamports_payment", meta.compute_units_consumed, cu::LAMPORTS_PAYMENT);
+    assert_compute_units(
+        "lamports_payment",
+        meta.compute_units_consumed,
+        cu::LAMPORTS_PAYMENT,
+    );
 
     let ix = ctx.spend_ix(payment, ctx.secret, AMOUNT);
     let receiver = ctx.receiver.insecure_clone();

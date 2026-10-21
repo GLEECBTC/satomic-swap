@@ -14,7 +14,9 @@ pub struct TxFailure(pub String);
 
 impl TxFailure {
     /// The program's own error code, or 0 when the transaction never reached the program.
-    pub fn code(&self) -> u32 { custom_code(&self.0) }
+    pub fn code(&self) -> u32 {
+        custom_code(&self.0)
+    }
 
     /// Whether the runtime rejected it because a required account did not sign.
     ///
@@ -103,7 +105,10 @@ pub mod cu {
 
 /// Asserts an instruction stayed under its ceiling, and that it actually ran.
 pub fn assert_compute_units(name: &str, consumed: u64, ceiling: u64) {
-    assert!(consumed > 0, "{name} consumed no compute units, so it cannot have executed");
+    assert!(
+        consumed > 0,
+        "{name} consumed no compute units, so it cannot have executed"
+    );
     assert!(
         consumed <= ceiling,
         "{name} consumed {consumed} compute units, over its {ceiling} ceiling. If this is a \

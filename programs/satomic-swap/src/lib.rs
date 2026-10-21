@@ -17,15 +17,17 @@
 #![allow(unexpected_cfgs)]
 
 use anchor_lang::prelude::*;
-use solana_sha256_hasher::hash;
 use anchor_spl::associated_token::AssociatedToken;
 use anchor_spl::token_2022::spl_token_2022::extension::transfer_fee::TransferFeeConfig;
-use anchor_spl::token_2022::spl_token_2022::extension::{BaseStateWithExtensions, PodStateWithExtensions};
+use anchor_spl::token_2022::spl_token_2022::extension::{
+    BaseStateWithExtensions, PodStateWithExtensions,
+};
 use anchor_spl::token_2022::spl_token_2022::pod::PodMint;
 use anchor_spl::token_interface::{
     close_account, transfer_checked, CloseAccount, Mint, TokenAccount, TokenInterface,
     TransferChecked,
 };
+use solana_sha256_hasher::hash;
 
 pub mod errors;
 pub mod events;

@@ -11,9 +11,14 @@ use satomic_swap::errors::SwapError;
 use satomic_swap::events::{PaymentRefunded, PaymentSent, PaymentSpent};
 use serde_json::Value;
 
-const IDL: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../idl/satomic_swap.json"));
+const IDL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../idl/satomic_swap.json"
+));
 
-fn idl() -> Value { serde_json::from_str(IDL).expect("the checked-in IDL must be valid JSON") }
+fn idl() -> Value {
+    serde_json::from_str(IDL).expect("the checked-in IDL must be valid JSON")
+}
 
 /// The discriminator the IDL lists for a named entry under `key`.
 fn discriminator(idl: &Value, key: &str, name: &str) -> Vec<u8> {
@@ -59,7 +64,10 @@ fn instruction_discriminators_match_the_program() {
             "sender_refund_lamports",
             satomic_swap::instruction::SenderRefundLamports::DISCRIMINATOR,
         ),
-        ("spl_payment", satomic_swap::instruction::SplPayment::DISCRIMINATOR),
+        (
+            "spl_payment",
+            satomic_swap::instruction::SplPayment::DISCRIMINATOR,
+        ),
         (
             "receiver_spend_spl",
             satomic_swap::instruction::ReceiverSpendSpl::DISCRIMINATOR,
@@ -109,9 +117,15 @@ fn error_codes_match_the_program() {
         (SwapError::InvalidSecret, "InvalidSecret"),
         (SwapError::LockTimeNotExpired, "LockTimeNotExpired"),
         (SwapError::InvalidLockTime, "InvalidLockTime"),
-        (SwapError::InsufficientVaultBalance, "InsufficientVaultBalance"),
+        (
+            SwapError::InsufficientVaultBalance,
+            "InsufficientVaultBalance",
+        ),
         (SwapError::LamportOverflow, "LamportOverflow"),
-        (SwapError::TransferFeeNotSupported, "TransferFeeNotSupported"),
+        (
+            SwapError::TransferFeeNotSupported,
+            "TransferFeeNotSupported",
+        ),
     ] {
         let expected = code as u32 + anchor_lang::error::ERROR_CODE_OFFSET;
         let entry = errors

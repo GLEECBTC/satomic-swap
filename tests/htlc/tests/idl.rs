@@ -146,3 +146,177 @@ fn error_codes_match_the_program() {
         "an error was added or removed; check nothing after it was renumbered"
     );
 }
+
+/// KDF hand-builds each instruction's account list, so the order and the signer and writable flags
+/// are as much a part of the contract as the discriminator - and they are where a hand-rolled
+/// encoder actually goes wrong. A discriminator check alone would pass a reordered or re-flagged
+/// account list and leave KDF building instructions the program rejects.
+///
+/// Each field gets a distinct key, so a meta's position identifies which field produced it.
+#[test]
+fn account_order_and_flags_match_the_program() {
+    use anchor_lang::ToAccountMetas;
+    use solana_pubkey::Pubkey;
+    use std::collections::HashMap;
+
+    let idl = idl();
+
+    fn keys(names: &[&'static str]) -> HashMap<&'static str, Pubkey> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (*name, Pubkey::new_from_array([i as u8 + 1; 32])))
+            .collect()
+    }
+
+    let check = |instruction: &str,
+                 keys: &HashMap<&'static str, Pubkey>,
+                 metas: Vec<anchor_lang::prelude::AccountMeta>| {
+        let accounts = idl["instructions"]
+            .as_array()
+            .expect("IDL instructions")
+            .iter()
+            .find(|ix| ix["name"] == instruction)
+            .unwrap_or_else(|| panic!("IDL has no instruction {instruction}"))["accounts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{instruction} has no accounts"));
+
+        assert_eq!(
+            accounts.len(),
+            metas.len(),
+            "{instruction} takes a different number of accounts"
+        );
+
+        for (position, (account, meta)) in accounts.iter().zip(&metas).enumerate() {
+            let name = account["name"].as_str().expect("account name");
+            assert_eq!(
+                Some(&meta.pubkey),
+                keys.get(name),
+                "{instruction}: position {position} is {name} in the IDL but a different account in the program"
+            );
+            assert_eq!(
+                meta.is_signer,
+                account["signer"].as_bool().unwrap_or(false),
+                "{instruction}.{name}: signer flag differs"
+            );
+            assert_eq!(
+                meta.is_writable,
+                account["writable"].as_bool().unwrap_or(false),
+                "{instruction}.{name}: writable flag differs"
+            );
+        }
+    };
+
+    let k = keys(&["sender", "receiver", "payment", "system_program"]);
+    check(
+        "lamports_payment",
+        &k,
+        satomic_swap::accounts::LamportsPayment {
+            sender: k["sender"],
+            receiver: k["receiver"],
+            payment: k["payment"],
+            system_program: k["system_program"],
+        }
+        .to_account_metas(None),
+    );
+
+    let k = keys(&["receiver", "sender", "payment"]);
+    check(
+        "receiver_spend_lamports",
+        &k,
+        satomic_swap::accounts::ReceiverSpendLamports {
+            receiver: k["receiver"],
+            sender: k["sender"],
+            payment: k["payment"],
+        }
+        .to_account_metas(None),
+    );
+
+    let k = keys(&["sender", "receiver", "payment"]);
+    check(
+        "sender_refund_lamports",
+        &k,
+        satomic_swap::accounts::SenderRefundLamports {
+            sender: k["sender"],
+            receiver: k["receiver"],
+            payment: k["payment"],
+        }
+        .to_account_metas(None),
+    );
+
+    let k = keys(&[
+        "sender",
+        "receiver",
+        "mint",
+        "sender_token_account",
+        "payment",
+        "vault",
+        "token_program",
+        "associated_token_program",
+        "system_program",
+    ]);
+    check(
+        "spl_payment",
+        &k,
+        satomic_swap::accounts::SplPayment {
+            sender: k["sender"],
+            receiver: k["receiver"],
+            mint: k["mint"],
+            sender_token_account: k["sender_token_account"],
+            payment: k["payment"],
+            vault: k["vault"],
+            token_program: k["token_program"],
+            associated_token_program: k["associated_token_program"],
+            system_program: k["system_program"],
+        }
+        .to_account_metas(None),
+    );
+
+    let k = keys(&[
+        "receiver",
+        "sender",
+        "mint",
+        "receiver_token_account",
+        "payment",
+        "vault",
+        "token_program",
+    ]);
+    check(
+        "receiver_spend_spl",
+        &k,
+        satomic_swap::accounts::ReceiverSpendSpl {
+            receiver: k["receiver"],
+            sender: k["sender"],
+            mint: k["mint"],
+            receiver_token_account: k["receiver_token_account"],
+            payment: k["payment"],
+            vault: k["vault"],
+            token_program: k["token_program"],
+        }
+        .to_account_metas(None),
+    );
+
+    let k = keys(&[
+        "sender",
+        "receiver",
+        "mint",
+        "sender_token_account",
+        "payment",
+        "vault",
+        "token_program",
+    ]);
+    check(
+        "sender_refund_spl",
+        &k,
+        satomic_swap::accounts::SenderRefundSpl {
+            sender: k["sender"],
+            receiver: k["receiver"],
+            mint: k["mint"],
+            sender_token_account: k["sender_token_account"],
+            payment: k["payment"],
+            vault: k["vault"],
+            token_program: k["token_program"],
+        }
+        .to_account_metas(None),
+    );
+}

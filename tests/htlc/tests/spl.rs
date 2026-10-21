@@ -17,7 +17,7 @@ use spl_token_2022_interface::instruction::initialize_mint2;
 use spl_token_2022_interface::state::{Account as TokenAccountState, AccountState, Mint as MintState};
 
 mod common;
-use common::{custom_code, expect_event};
+use common::{expect_event, TxFailure};
 use satomic_swap::events::{PaymentRefunded, PaymentSent, PaymentSpent};
 
 const PROGRAM_ID: Pubkey = satomic_swap::ID;
@@ -160,7 +160,7 @@ impl Ctx {
         .0
     }
 
-    fn send(&mut self, ix: Instruction, signer: &Keypair) -> Result<TransactionMetadata, u32> {
+    fn send(&mut self, ix: Instruction, signer: &Keypair) -> Result<TransactionMetadata, TxFailure> {
         self.send_signed_by(ix, signer, signer)
     }
 
@@ -171,7 +171,7 @@ impl Ctx {
         ix: Instruction,
         payer: &Keypair,
         signer: &Keypair,
-    ) -> Result<TransactionMetadata, u32> {
+    ) -> Result<TransactionMetadata, TxFailure> {
         let mut signers = vec![payer];
         if signer.pubkey() != payer.pubkey() {
             signers.push(signer);
@@ -189,12 +189,12 @@ impl Ctx {
                 if std::env::var("DUMP_ERR").is_ok() {
                     eprintln!("raw tx error: {rendered}");
                 }
-                Err(custom_code(&rendered))
+                Err(TxFailure(rendered))
             },
         }
     }
 
-    fn pay(&mut self) -> Result<(Pubkey, TransactionMetadata), u32> {
+    fn pay(&mut self) -> Result<(Pubkey, TransactionMetadata), TxFailure> {
         let payment = self.payment_pda();
         let ix = Instruction {
             program_id: PROGRAM_ID,
@@ -221,7 +221,7 @@ impl Ctx {
         self.send(ix, &sender).map(|meta| (payment, meta))
     }
 
-    fn spend(&mut self, payment: Pubkey, secret: [u8; 32]) -> Result<TransactionMetadata, u32> {
+    fn spend(&mut self, payment: Pubkey, secret: [u8; 32]) -> Result<TransactionMetadata, TxFailure> {
         let ix = Instruction {
             program_id: PROGRAM_ID,
             accounts: satomic_swap::accounts::ReceiverSpendSpl {
@@ -246,7 +246,7 @@ impl Ctx {
         self.send(ix, &receiver)
     }
 
-    fn refund(&mut self, payment: Pubkey) -> Result<TransactionMetadata, u32> {
+    fn refund(&mut self, payment: Pubkey) -> Result<TransactionMetadata, TxFailure> {
         let ix = Instruction {
             program_id: PROGRAM_ID,
             accounts: satomic_swap::accounts::SenderRefundSpl {
@@ -268,6 +268,65 @@ impl Ctx {
         };
         let sender = self.sender.insecure_clone();
         self.send(ix, &sender)
+    }
+
+    /// Sends `ix` paid for and signed only by `payer`, leaving any other required signature
+    /// missing. This is what impersonation actually looks like: the attacker names the real
+    /// counterparty so the PDA still resolves, and then cannot sign for them.
+    fn send_without_all_signatures(&mut self, ix: Instruction, payer: &Keypair) -> Result<TransactionMetadata, TxFailure> {
+        let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
+        tx.partial_sign(&[payer], self.svm.latest_blockhash());
+        match self.svm.send_transaction(tx) {
+            Ok(meta) => Ok(meta),
+            Err(failed) => Err(TxFailure(format!("{:?}", failed.err))),
+        }
+    }
+
+    /// The spend instruction as the real receiver would send it.
+    fn spend_ix(&self, payment: Pubkey, secret: [u8; 32]) -> Instruction {
+        Instruction {
+            program_id: PROGRAM_ID,
+            accounts: satomic_swap::accounts::ReceiverSpendSpl {
+                receiver: self.receiver.pubkey(),
+                sender: self.sender.pubkey(),
+                mint: self.mint,
+                receiver_token_account: ata(&self.receiver.pubkey(), &self.mint, &self.token_program),
+                payment,
+                vault: ata(&payment, &self.mint, &self.token_program),
+                token_program: self.token_program,
+            }
+            .to_account_metas(None),
+            data: satomic_swap::instruction::ReceiverSpendSpl {
+                secret,
+                secret_hash: self.secret_hash,
+                lock_time: LOCK_TIME,
+                amount: AMOUNT,
+            }
+            .data(),
+        }
+    }
+
+    /// The refund instruction as the real sender would send it.
+    fn refund_ix(&self, payment: Pubkey) -> Instruction {
+        Instruction {
+            program_id: PROGRAM_ID,
+            accounts: satomic_swap::accounts::SenderRefundSpl {
+                sender: self.sender.pubkey(),
+                receiver: self.receiver.pubkey(),
+                mint: self.mint,
+                sender_token_account: ata(&self.sender.pubkey(), &self.mint, &self.token_program),
+                payment,
+                vault: ata(&payment, &self.mint, &self.token_program),
+                token_program: self.token_program,
+            }
+            .to_account_metas(None),
+            data: satomic_swap::instruction::SenderRefundSpl {
+                secret_hash: self.secret_hash,
+                lock_time: LOCK_TIME,
+                amount: AMOUNT,
+            }
+            .data(),
+        }
     }
 
     fn token_balance(&self, address: &Pubkey) -> u64 {
@@ -329,8 +388,8 @@ fn spl_refund_is_gated_by_the_lock_time() {
     let (payment, _) = ctx.pay().expect("payment should succeed");
 
     assert_eq!(
-        ctx.refund(payment).err(),
-        Some(E_LOCK_TIME_NOT_EXPIRED),
+        ctx.refund(payment).unwrap_err().code(),
+        E_LOCK_TIME_NOT_EXPIRED,
         "refund must wait for expiry"
     );
 
@@ -349,7 +408,7 @@ fn spl_refund_is_gated_by_the_lock_time() {
 fn spl_spend_with_the_wrong_secret_is_rejected() {
     let mut ctx = setup(SPL_TOKEN, None);
     let (payment, _) = ctx.pay().expect("payment should succeed");
-    assert_eq!(ctx.spend(payment, [8u8; 32]).err(), Some(E_INVALID_SECRET));
+    assert_eq!(ctx.spend(payment, [8u8; 32]).unwrap_err().code(), E_INVALID_SECRET);
 }
 
 #[test]
@@ -366,8 +425,8 @@ fn token_2022_mint_without_a_fee_works() {
 fn a_mint_that_charges_a_transfer_fee_is_rejected() {
     let mut ctx = setup(TOKEN_2022, Some(250));
     assert_eq!(
-        ctx.pay().err(),
-        Some(E_TRANSFER_FEE_NOT_SUPPORTED),
+        ctx.pay().unwrap_err().code(),
+        E_TRANSFER_FEE_NOT_SUPPORTED,
         "a fee would leave the vault short of the agreed amount"
     );
 }
@@ -376,5 +435,82 @@ fn a_mint_that_charges_a_transfer_fee_is_rejected() {
 fn a_fee_free_mint_that_could_still_add_one_is_rejected() {
     // Zero fee today, but the config authority can raise it before the payment is claimed.
     let mut ctx = setup(TOKEN_2022, Some(0));
-    assert_eq!(ctx.pay().err(), Some(E_TRANSFER_FEE_NOT_SUPPORTED));
+    assert_eq!(
+        ctx.pay().unwrap_err().code(),
+        E_TRANSFER_FEE_NOT_SUPPORTED);
+}
+
+// --- Authorization ---
+//
+// The same gap as on the lamports path: knowing the secret must not be enough to move the funds.
+
+#[test]
+fn a_third_party_who_knows_the_secret_cannot_spend_spl() {
+    let mut ctx = setup(SPL_TOKEN, None);
+    let (payment, _) = ctx.pay().expect("payment should succeed");
+    let vault = ata(&payment, &ctx.mint, &SPL_TOKEN);
+    let attacker = Keypair::new();
+    ctx.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+
+    // Naming the real receiver keeps the PDA correct, so only the missing signature stops this.
+    let ix = ctx.spend_ix(payment, ctx.secret);
+    let failure = ctx
+        .send_without_all_signatures(ix, &attacker)
+        .expect_err("a third party must not be able to claim the tokens");
+
+    assert!(failure.missing_signature(), "expected a signature failure, got {failure:?}");
+    assert_eq!(ctx.token_balance(&vault), AMOUNT, "tokens stay in the vault");
+}
+
+#[test]
+fn the_sender_cannot_spend_its_own_spl_payment() {
+    let mut ctx = setup(SPL_TOKEN, None);
+    let (payment, _) = ctx.pay().expect("payment should succeed");
+    let vault = ata(&payment, &ctx.mint, &SPL_TOKEN);
+
+    let ix = ctx.spend_ix(payment, ctx.secret);
+    let sender = ctx.sender.insecure_clone();
+    let failure = ctx
+        .send_without_all_signatures(ix, &sender)
+        .expect_err("the sender must not be able to spend as the receiver");
+
+    assert!(failure.missing_signature(), "expected a signature failure, got {failure:?}");
+    assert_eq!(ctx.token_balance(&vault), AMOUNT, "tokens stay in the vault");
+}
+
+#[test]
+fn the_receiver_cannot_refund_an_spl_payment_after_expiry() {
+    let mut ctx = setup(SPL_TOKEN, None);
+    let (payment, _) = ctx.pay().expect("payment should succeed");
+    let vault = ata(&payment, &ctx.mint, &SPL_TOKEN);
+    ctx.warp_past_lock_time();
+
+    let ix = ctx.refund_ix(payment);
+    let receiver = ctx.receiver.insecure_clone();
+    let failure = ctx
+        .send_without_all_signatures(ix, &receiver)
+        .expect_err("only the sender may refund");
+
+    assert!(failure.missing_signature(), "expected a signature failure, got {failure:?}");
+    assert_eq!(ctx.token_balance(&vault), AMOUNT, "tokens stay in the vault");
+}
+
+/// The vault is an associated account of the payment PDA, so redirecting the transfer means
+/// passing a token account the constraints do not accept.
+#[test]
+fn the_receiver_cannot_send_the_tokens_to_someone_else() {
+    let mut ctx = setup(SPL_TOKEN, None);
+    let (payment, _) = ctx.pay().expect("payment should succeed");
+    let outsider = Keypair::new();
+    let outsider_ata = put_token_account(&mut ctx.svm, &outsider.pubkey(), &ctx.mint, &SPL_TOKEN, 0);
+
+    let mut ix = ctx.spend_ix(payment, ctx.secret);
+    // accounts[3] is `receiver_token_account`, which is constrained to the receiver's authority.
+    ix.accounts[3].pubkey = outsider_ata;
+
+    let receiver = ctx.receiver.insecure_clone();
+    assert!(
+        ctx.send(ix, &receiver).is_err(),
+        "the destination must belong to the receiver named in the seeds"
+    );
 }

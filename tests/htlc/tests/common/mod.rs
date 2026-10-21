@@ -3,6 +3,24 @@
 use anchor_lang::{AnchorDeserialize, Discriminator};
 use base64::{engine::general_purpose::STANDARD, Engine};
 
+/// A rejected transaction, keeping the rendered error so a test can assert *why* it failed rather
+/// than only that it did.
+#[derive(Debug, PartialEq)]
+pub struct TxFailure(pub String);
+
+impl TxFailure {
+    /// The program's own error code, or 0 when the transaction never reached the program.
+    pub fn code(&self) -> u32 { custom_code(&self.0) }
+
+    /// Whether the runtime rejected it because a required account did not sign.
+    ///
+    /// This is the shape an impersonation attempt takes: the attacker names the real counterparty
+    /// so the PDA still resolves, but cannot produce that party's signature.
+    pub fn missing_signature(&self) -> bool {
+        self.0.contains("MissingRequiredSignature") || self.0.contains("SignatureFailure")
+    }
+}
+
 /// Pulls the `Custom(n)` code out of a formatted transaction error, or 0 if it isn't one.
 pub fn custom_code(rendered: &str) -> u32 {
     rendered

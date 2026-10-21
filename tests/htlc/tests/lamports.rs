@@ -14,7 +14,7 @@ use solana_signer::Signer;
 use solana_transaction::Transaction;
 
 mod common;
-use common::{custom_code, expect_event};
+use common::{expect_event, TxFailure};
 use satomic_swap::events::{PaymentRefunded, PaymentSent, PaymentSpent};
 
 const PROGRAM_ID: Pubkey = satomic_swap::ID;
@@ -65,7 +65,7 @@ fn payment_pda(sender: &Pubkey, receiver: &Pubkey, secret_hash: &[u8; 32], amoun
 }
 
 impl Ctx {
-    fn send(&mut self, ix: Instruction, signer: &Keypair) -> Result<TransactionMetadata, u32> {
+    fn send(&mut self, ix: Instruction, signer: &Keypair) -> Result<TransactionMetadata, TxFailure> {
         self.send_signed_by(ix, signer, signer)
     }
 
@@ -76,7 +76,7 @@ impl Ctx {
         ix: Instruction,
         payer: &Keypair,
         signer: &Keypair,
-    ) -> Result<TransactionMetadata, u32> {
+    ) -> Result<TransactionMetadata, TxFailure> {
         let mut signers = vec![payer];
         if signer.pubkey() != payer.pubkey() {
             signers.push(signer);
@@ -89,7 +89,7 @@ impl Ctx {
         );
         match self.svm.send_transaction(tx) {
             Ok(meta) => Ok(meta),
-            Err(failed) => Err(custom_code(&format!("{:?}", failed.err))),
+            Err(failed) => Err(TxFailure(format!("{:?}", failed.err))),
         }
     }
 
@@ -160,6 +160,18 @@ impl Ctx {
         }
     }
 
+    /// Sends `ix` paid for and signed only by `payer`, leaving any other required signature
+    /// missing. This is what impersonation actually looks like: the attacker names the real
+    /// counterparty so the PDA still resolves, and then cannot sign for them.
+    fn send_without_all_signatures(&mut self, ix: Instruction, payer: &Keypair) -> Result<TransactionMetadata, TxFailure> {
+        let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
+        tx.partial_sign(&[payer], self.svm.latest_blockhash());
+        match self.svm.send_transaction(tx) {
+            Ok(meta) => Ok(meta),
+            Err(failed) => Err(TxFailure(format!("{:?}", failed.err))),
+        }
+    }
+
     fn warp_past_lock_time(&mut self) {
         let mut clock: Clock = self.svm.get_sysvar();
         clock.unix_timestamp = LOCK_TIME as i64 + 1;
@@ -225,8 +237,8 @@ fn refund_before_lock_time_is_rejected() {
     let ix = ctx.refund_ix(payment);
     let sender = ctx.sender.insecure_clone();
     assert_eq!(
-        ctx.send(ix, &sender).err(),
-        Some(E_LOCK_TIME_NOT_EXPIRED),
+        ctx.send(ix, &sender).unwrap_err().code(),
+        E_LOCK_TIME_NOT_EXPIRED,
         "the original program allowed this, which broke atomicity"
     );
     assert!(ctx.svm.get_balance(&payment).unwrap() > AMOUNT, "funds stay locked");
@@ -260,7 +272,9 @@ fn spending_with_the_wrong_secret_is_rejected() {
 
     let ix = ctx.spend_ix(payment, [9u8; 32], AMOUNT);
     let receiver = ctx.receiver.insecure_clone();
-    assert_eq!(ctx.send(ix, &receiver).err(), Some(E_INVALID_SECRET));
+    assert_eq!(
+        ctx.send(ix, &receiver).unwrap_err().code(),
+        E_INVALID_SECRET);
 }
 
 #[test]
@@ -287,4 +301,123 @@ fn a_payment_cannot_be_spent_twice() {
 
     let ix = ctx.spend_ix(payment, ctx.secret, AMOUNT);
     assert!(ctx.send(ix, &receiver).is_err(), "the closed account must not be spendable again");
+}
+
+// --- Authorization ---
+//
+// Everything above tests the *secret*. These test the *signer*: knowing the secret must not be
+// enough, or a watcher that learns it from a spend on the other chain could take these funds too.
+
+#[test]
+fn a_third_party_who_knows_the_secret_cannot_spend() {
+    let mut ctx = setup();
+    let payment = ctx.pay();
+    let attacker = Keypair::new();
+    ctx.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+
+    // Naming the real receiver keeps the PDA correct, so only the missing signature stops this.
+    let ix = ctx.spend_ix(payment, ctx.secret, AMOUNT);
+    let failure = ctx
+        .send_without_all_signatures(ix, &attacker)
+        .expect_err("a third party must not be able to claim the payment");
+
+    assert!(failure.missing_signature(), "expected a signature failure, got {failure:?}");
+    assert!(ctx.svm.get_balance(&payment).unwrap() > AMOUNT, "funds stay locked");
+}
+
+#[test]
+fn a_third_party_substituting_itself_as_receiver_finds_no_payment() {
+    let mut ctx = setup();
+    ctx.pay();
+    let attacker = Keypair::new();
+    ctx.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+
+    // The receiver is a PDA seed, so an attacker who signs for itself addresses a payment that was
+    // never made rather than the real one.
+    let attacker_payment = payment_pda(&ctx.sender.pubkey(), &attacker.pubkey(), &ctx.secret_hash, AMOUNT);
+    let ix = Instruction {
+        program_id: PROGRAM_ID,
+        accounts: satomic_swap::accounts::ReceiverSpendLamports {
+            receiver: attacker.pubkey(),
+            sender: ctx.sender.pubkey(),
+            payment: attacker_payment,
+        }
+        .to_account_metas(None),
+        data: satomic_swap::instruction::ReceiverSpendLamports {
+            secret: ctx.secret,
+            secret_hash: ctx.secret_hash,
+            lock_time: LOCK_TIME,
+            amount: AMOUNT,
+        }
+        .data(),
+    };
+
+    assert!(ctx.send(ix, &attacker).is_err(), "there is no payment at that address");
+}
+
+#[test]
+fn the_sender_cannot_spend_its_own_payment() {
+    let mut ctx = setup();
+    let payment = ctx.pay();
+
+    // The maker picks the secret, so it knows it: the signer check is the only thing keeping it
+    // from taking its own payment back before the lock time.
+    let ix = ctx.spend_ix(payment, ctx.secret, AMOUNT);
+    let sender = ctx.sender.insecure_clone();
+    let failure = ctx
+        .send_without_all_signatures(ix, &sender)
+        .expect_err("the sender must not be able to spend as the receiver");
+
+    assert!(failure.missing_signature(), "expected a signature failure, got {failure:?}");
+    assert!(ctx.svm.get_balance(&payment).unwrap() > AMOUNT, "funds stay locked");
+}
+
+#[test]
+fn the_receiver_cannot_refund_even_after_expiry() {
+    let mut ctx = setup();
+    let payment = ctx.pay();
+    ctx.warp_past_lock_time();
+
+    // Expiry entitles the *sender* to a refund. If the receiver could trigger it, the refund would
+    // still pay the sender, but the receiver could grief a swap it no longer wants to complete.
+    let ix = ctx.refund_ix(payment);
+    let receiver = ctx.receiver.insecure_clone();
+    let failure = ctx
+        .send_without_all_signatures(ix, &receiver)
+        .expect_err("only the sender may refund");
+
+    assert!(failure.missing_signature(), "expected a signature failure, got {failure:?}");
+    assert!(ctx.svm.get_balance(&payment).unwrap() > AMOUNT, "funds stay locked");
+}
+
+#[test]
+fn a_third_party_cannot_refund_after_expiry() {
+    let mut ctx = setup();
+    let payment = ctx.pay();
+    ctx.warp_past_lock_time();
+    let attacker = Keypair::new();
+    ctx.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+
+    let ix = ctx.refund_ix(payment);
+    let failure = ctx
+        .send_without_all_signatures(ix, &attacker)
+        .expect_err("a third party must not be able to trigger a refund");
+
+    assert!(failure.missing_signature(), "expected a signature failure, got {failure:?}");
+    assert!(ctx.svm.get_balance(&payment).unwrap() > AMOUNT, "funds stay locked");
+}
+
+/// A control for the tests above: the same helper must let a properly signed call through, or
+/// they would all be passing for the wrong reason.
+#[test]
+fn the_partial_signing_helper_still_admits_a_legitimate_spend() {
+    let mut ctx = setup();
+    let payment = ctx.pay();
+
+    let ix = ctx.spend_ix(payment, ctx.secret, AMOUNT);
+    let receiver = ctx.receiver.insecure_clone();
+
+    ctx.send_without_all_signatures(ix, &receiver)
+        .expect("the receiver is the only required signer, so this is fully signed");
+    assert_eq!(ctx.svm.get_balance(&payment).unwrap_or(0), 0, "payment was settled");
 }

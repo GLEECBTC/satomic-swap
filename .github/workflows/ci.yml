@@ -1,0 +1,91 @@
+name: CI
+
+# Runs on pull requests as well as on demand. The rest of the Komodo tooling keeps CI
+# dispatch-only to save Actions minutes, but this program is heading for an audit and will hold
+# user funds, so a red test should be able to block a merge rather than wait to be noticed.
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned so a build is reproducible for the audit. Bump both deliberately.
+  SOLANA_VERSION: v4.2.2
+  ANCHOR_VERSION: 1.2.0
+  # The program builds on stable. The test crate needs nightly: litesvm's dependency tree uses the
+  # unstable `maybe_uninit_write_slice`, so `cargo test` on stable fails to compile.
+  NIGHTLY: nightly-2026-01-30
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup toolchain install "$NIGHTLY" --profile minimal --component clippy
+          rustup default stable
+
+      - name: Cache cargo and build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.local/share/solana
+            target
+          key: ${{ runner.os }}-solana-${{ env.SOLANA_VERSION }}-anchor-${{ env.ANCHOR_VERSION }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-solana-${{ env.SOLANA_VERSION }}-anchor-${{ env.ANCHOR_VERSION }}-
+
+      - name: Install the Solana toolchain
+        run: |
+          if [ ! -x "$HOME/.local/share/solana/install/active_release/bin/cargo-build-sbf" ]; then
+            sh -c "$(curl -sSfL https://release.anza.xyz/${SOLANA_VERSION}/install)"
+          fi
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Install Anchor
+        run: |
+          if ! command -v anchor >/dev/null || [ "$(anchor --version)" != "anchor-cli $ANCHOR_VERSION" ]; then
+            cargo install anchor-cli --version "$ANCHOR_VERSION" --locked --force
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint the program
+        run: cargo clippy -p satomic-swap -- -D warnings
+
+      - name: Lint the tests
+        run: cargo +$NIGHTLY clippy -p htlc-tests --tests -- -D warnings
+
+      # The program crate must stay free of dev-dependencies: `anchor idl build` compiles its test
+      # target, and litesvm in that tree would drag nightly-only code into a stable build. The
+      # tests therefore live in their own crate, and this keeps them there.
+      - name: Check the program has no dev-dependencies
+        run: |
+          if grep -q '^\[dev-dependencies\]' programs/satomic-swap/Cargo.toml; then
+            echo "::error file=programs/satomic-swap/Cargo.toml::The program crate must not have dev-dependencies; put tests in tests/htlc instead (anchor idl build compiles the test target)"
+            exit 1
+          fi
+
+      - name: Build the program
+        run: anchor build
+
+      - name: Check the checked-in IDL is current
+        run: |
+          anchor idl build > /tmp/idl.json
+          if ! diff -u idl/satomic_swap.json /tmp/idl.json; then
+            echo "::error file=idl/satomic_swap.json::The checked-in IDL is stale. Run 'anchor idl build > idl/satomic_swap.json' and update KDF's copy."
+            exit 1
+          fi
+
+      - name: Run the tests
+        run: cargo +$NIGHTLY test -p htlc-tests

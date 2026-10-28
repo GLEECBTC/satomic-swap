@@ -1,40 +1,13 @@
-[package]
-name = "satomic-swap"
-version = "0.1.0"
-edition = "2021"
-
-[lib]
-crate-type = ["cdylib", "lib"]
-
-[dependencies]
-solana-program = "1.9.20"
-
-[dev-dependencies]
-solana-program-test = "1.9.20"
-solana-sdk = "1.9.20"
-tokio = "1.36.0"
-
-[features]
-default = []
+[workspace]
+members = ["programs/*", "tests/*"]
+resolver = "2"
 
 [profile.release]
+overflow-checks = true
 lto = "fat"
 codegen-units = 1
-panic = "abort"
-overflow-checks = true
 
 [profile.release.build-override]
 opt-level = 3
 incremental = false
 codegen-units = 1
-
-[profile.test]
-debug-assertions = false
-
-[profile.dev]
-opt-level = 0
-debug = 1
-debug-assertions = false
-panic = 'unwind'
-incremental = true
-codegen-units = 256

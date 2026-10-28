@@ -1,0 +1,1022 @@
+{
+  "address": "54mDjQz6jS9sggCV1P5GoUzqHaBEueGVZqmaMPLt2tDx",
+  "metadata": {
+    "name": "satomic_swap",
+    "version": "0.2.0",
+    "spec": "0.1.0",
+    "description": "HTLC atomic swap program for Solana, used by the Komodo DeFi Framework"
+  },
+  "instructions": [
+    {
+      "name": "lamports_payment",
+      "docs": [
+        "Locks `amount` lamports for `receiver`."
+      ],
+      "discriminator": [
+        159,
+        67,
+        83,
+        108,
+        98,
+        157,
+        176,
+        133
+      ],
+      "accounts": [
+        {
+          "name": "sender",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "receiver"
+        },
+        {
+          "name": "payment",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  97,
+                  121,
+                  109,
+                  101,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "sender"
+              },
+              {
+                "kind": "account",
+                "path": "receiver"
+              },
+              {
+                "kind": "arg",
+                "path": "secret_hash"
+              },
+              {
+                "kind": "arg",
+                "path": "lock_time"
+              },
+              {
+                "kind": "arg",
+                "path": "amount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "secret_hash",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "lock_time",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "receiver_spend_lamports",
+      "docs": [
+        "Claims a lamports payment by revealing the secret. The rent goes back to the sender."
+      ],
+      "discriminator": [
+        61,
+        83,
+        224,
+        137,
+        180,
+        190,
+        108,
+        249
+      ],
+      "accounts": [
+        {
+          "name": "receiver",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "sender",
+          "writable": true
+        },
+        {
+          "name": "payment",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  97,
+                  121,
+                  109,
+                  101,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "sender"
+              },
+              {
+                "kind": "account",
+                "path": "receiver"
+              },
+              {
+                "kind": "arg",
+                "path": "secret_hash"
+              },
+              {
+                "kind": "arg",
+                "path": "lock_time"
+              },
+              {
+                "kind": "arg",
+                "path": "amount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "secret",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "secret_hash",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "lock_time",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "receiver_spend_spl",
+      "docs": [
+        "Claims an SPL payment by revealing the secret. The receiver gets everything the vault holds,",
+        "which is `amount` plus anything someone else deposited."
+      ],
+      "discriminator": [
+        122,
+        234,
+        6,
+        35,
+        234,
+        228,
+        180,
+        62
+      ],
+      "accounts": [
+        {
+          "name": "receiver",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "sender",
+          "writable": true
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "receiver_token_account",
+          "writable": true
+        },
+        {
+          "name": "payment",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  97,
+                  121,
+                  109,
+                  101,
+                  110,
+                  116,
+                  95,
+                  115,
+                  112,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "sender"
+              },
+              {
+                "kind": "account",
+                "path": "receiver"
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              },
+              {
+                "kind": "arg",
+                "path": "secret_hash"
+              },
+              {
+                "kind": "arg",
+                "path": "lock_time"
+              },
+              {
+                "kind": "arg",
+                "path": "amount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "payment"
+              },
+              {
+                "kind": "account",
+                "path": "token_program"
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "secret",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "secret_hash",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "lock_time",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "sender_refund_lamports",
+      "docs": [
+        "Refunds a lamports payment once `lock_time` has passed. `close = sender` returns the amount",
+        "together with the rent."
+      ],
+      "discriminator": [
+        15,
+        65,
+        67,
+        221,
+        108,
+        51,
+        4,
+        212
+      ],
+      "accounts": [
+        {
+          "name": "sender",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "receiver"
+        },
+        {
+          "name": "payment",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  97,
+                  121,
+                  109,
+                  101,
+                  110,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "sender"
+              },
+              {
+                "kind": "account",
+                "path": "receiver"
+              },
+              {
+                "kind": "arg",
+                "path": "secret_hash"
+              },
+              {
+                "kind": "arg",
+                "path": "lock_time"
+              },
+              {
+                "kind": "arg",
+                "path": "amount"
+              }
+            ]
+          }
+        }
+      ],
+      "args": [
+        {
+          "name": "secret_hash",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "lock_time",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "sender_refund_spl",
+      "docs": [
+        "Refunds an SPL payment once `lock_time` has passed. The sender gets everything the vault",
+        "holds, which is `amount` plus anything someone else deposited."
+      ],
+      "discriminator": [
+        204,
+        144,
+        81,
+        103,
+        36,
+        132,
+        151,
+        140
+      ],
+      "accounts": [
+        {
+          "name": "sender",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "receiver"
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "sender_token_account",
+          "writable": true
+        },
+        {
+          "name": "payment",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  97,
+                  121,
+                  109,
+                  101,
+                  110,
+                  116,
+                  95,
+                  115,
+                  112,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "sender"
+              },
+              {
+                "kind": "account",
+                "path": "receiver"
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              },
+              {
+                "kind": "arg",
+                "path": "secret_hash"
+              },
+              {
+                "kind": "arg",
+                "path": "lock_time"
+              },
+              {
+                "kind": "arg",
+                "path": "amount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "payment"
+              },
+              {
+                "kind": "account",
+                "path": "token_program"
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "secret_hash",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "lock_time",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "spl_payment",
+      "docs": [
+        "Locks `amount` of an SPL (or Token-2022) mint for `receiver`."
+      ],
+      "discriminator": [
+        60,
+        159,
+        30,
+        237,
+        182,
+        245,
+        101,
+        170
+      ],
+      "accounts": [
+        {
+          "name": "sender",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "receiver"
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "sender_token_account",
+          "writable": true
+        },
+        {
+          "name": "payment",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  112,
+                  97,
+                  121,
+                  109,
+                  101,
+                  110,
+                  116,
+                  95,
+                  115,
+                  112,
+                  108
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "sender"
+              },
+              {
+                "kind": "account",
+                "path": "receiver"
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              },
+              {
+                "kind": "arg",
+                "path": "secret_hash"
+              },
+              {
+                "kind": "arg",
+                "path": "lock_time"
+              },
+              {
+                "kind": "arg",
+                "path": "amount"
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "docs": [
+            "`init_if_needed`, because anyone may create an associated token account for any owner and",
+            "this address follows from the payment's parameters, so with `init` creating it first would",
+            "block the payment. Whatever an early creator deposits is swept out with the payment."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "payment"
+              },
+              {
+                "kind": "account",
+                "path": "token_program"
+              },
+              {
+                "kind": "account",
+                "path": "mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "associated_token_program",
+          "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "secret_hash",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        },
+        {
+          "name": "lock_time",
+          "type": "u64"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "Payment",
+      "discriminator": [
+        227,
+        231,
+        51,
+        26,
+        244,
+        88,
+        4,
+        148
+      ]
+    }
+  ],
+  "events": [
+    {
+      "name": "PaymentRefunded",
+      "discriminator": [
+        197,
+        178,
+        204,
+        105,
+        247,
+        64,
+        159,
+        4
+      ]
+    },
+    {
+      "name": "PaymentSent",
+      "discriminator": [
+        79,
+        213,
+        55,
+        247,
+        230,
+        109,
+        190,
+        93
+      ]
+    },
+    {
+      "name": "PaymentSpent",
+      "discriminator": [
+        230,
+        6,
+        183,
+        151,
+        114,
+        3,
+        32,
+        226
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "ZeroAmount",
+      "msg": "Payment amount must be greater than zero"
+    },
+    {
+      "code": 6001,
+      "name": "InvalidReceiver",
+      "msg": "Receiver must not be the default pubkey or the sender"
+    },
+    {
+      "code": 6002,
+      "name": "InvalidSecret",
+      "msg": "The provided secret does not hash to the payment's secret hash"
+    },
+    {
+      "code": 6003,
+      "name": "LockTimeNotExpired",
+      "msg": "The lock time has not expired yet, the payment cannot be refunded"
+    },
+    {
+      "code": 6004,
+      "name": "InvalidLockTime",
+      "msg": "Lock time does not fit in a unix timestamp"
+    },
+    {
+      "code": 6005,
+      "name": "InsufficientVaultBalance",
+      "msg": "The payment account holds fewer lamports than the locked amount"
+    },
+    {
+      "code": 6006,
+      "name": "LamportOverflow",
+      "msg": "Lamport arithmetic overflowed"
+    },
+    {
+      "code": 6007,
+      "name": "TransferFeeNotSupported",
+      "msg": "Mints with a transfer fee are not supported: the vault would receive less than the agreed amount"
+    },
+    {
+      "code": 6008,
+      "name": "MintExtensionNotSupported",
+      "msg": "This mint has an extension that could let someone other than the swap move or block the locked tokens"
+    }
+  ],
+  "types": [
+    {
+      "name": "Payment",
+      "docs": [
+        "The on-chain record of a locked payment.",
+        "",
+        "Everything that identifies a payment — sender, receiver, mint, secret hash, lock time and",
+        "amount — is in the PDA seeds, so the address itself is the commitment and none of it has to be",
+        "stored or re-validated here. The account exists to (a) prove the payment was made and (b) hold",
+        "the funds, and it is closed when the payment is spent or refunded so the rent goes back."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "bump",
+            "docs": [
+              "Canonical bump of this PDA, stored so spend/refund don't have to re-derive it."
+            ],
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PaymentRefunded",
+      "docs": [
+        "Emitted when the sender reclaims a payment after the lock time expired."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "payment",
+            "type": "pubkey"
+          },
+          {
+            "name": "sender",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PaymentSent",
+      "docs": [
+        "Emitted when funds are locked. Indexers and the Komodo DeFi Framework use these",
+        "to find payments and their outcomes, since the payment account is closed once it is settled."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "payment",
+            "type": "pubkey"
+          },
+          {
+            "name": "sender",
+            "type": "pubkey"
+          },
+          {
+            "name": "receiver",
+            "type": "pubkey"
+          },
+          {
+            "name": "mint",
+            "docs": [
+              "`None` for native SOL payments."
+            ],
+            "type": {
+              "option": "pubkey"
+            }
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "lock_time",
+            "type": "u64"
+          },
+          {
+            "name": "secret_hash",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "PaymentSpent",
+      "docs": [
+        "Emitted when the receiver claims a payment by revealing the secret."
+      ],
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "payment",
+            "type": "pubkey"
+          },
+          {
+            "name": "receiver",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "secret",
+            "docs": [
+              "The revealed preimage. The counterparty needs this to claim the other side of the swap."
+            ],
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

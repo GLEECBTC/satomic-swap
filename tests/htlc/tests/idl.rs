@@ -126,6 +126,10 @@ fn error_codes_match_the_program() {
             SwapError::TransferFeeNotSupported,
             "TransferFeeNotSupported",
         ),
+        (
+            SwapError::MintExtensionNotSupported,
+            "MintExtensionNotSupported",
+        ),
     ] {
         let expected = code as u32 + anchor_lang::error::ERROR_CODE_OFFSET;
         let entry = errors
@@ -142,7 +146,7 @@ fn error_codes_match_the_program() {
 
     assert_eq!(
         errors.len(),
-        8,
+        9,
         "an error was added or removed; check nothing after it was renumbered"
     );
 }

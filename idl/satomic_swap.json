@@ -194,7 +194,8 @@
     {
       "name": "receiver_spend_spl",
       "docs": [
-        "Claims an SPL payment by revealing the secret."
+        "Claims an SPL payment by revealing the secret. The receiver gets everything the vault holds,",
+        "which is `amount` plus anything someone else deposited."
       ],
       "discriminator": [
         122,
@@ -450,7 +451,8 @@
     {
       "name": "sender_refund_spl",
       "docs": [
-        "Refunds an SPL payment once `lock_time` has passed."
+        "Refunds an SPL payment once `lock_time` has passed. The sender gets everything the vault",
+        "holds, which is `amount` plus anything someone else deposited."
       ],
       "discriminator": [
         204,
@@ -688,6 +690,11 @@
         },
         {
           "name": "vault",
+          "docs": [
+            "`init_if_needed`, because anyone may create an associated token account for any owner and",
+            "this address follows from the payment's parameters, so with `init` creating it first would",
+            "block the payment. Whatever an early creator deposits is swept out with the payment."
+          ],
           "writable": true,
           "pda": {
             "seeds": [
@@ -872,6 +879,11 @@
       "code": 6007,
       "name": "TransferFeeNotSupported",
       "msg": "Mints with a transfer fee are not supported: the vault would receive less than the agreed amount"
+    },
+    {
+      "code": 6008,
+      "name": "MintExtensionNotSupported",
+      "msg": "This mint has an extension that could let someone other than the swap move or block the locked tokens"
     }
   ],
   "types": [

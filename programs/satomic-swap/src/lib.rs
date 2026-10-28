@@ -18,9 +18,11 @@
 
 use anchor_lang::prelude::*;
 use anchor_spl::associated_token::AssociatedToken;
+use anchor_spl::token_2022::spl_token_2022::extension::pausable::PausableConfig;
 use anchor_spl::token_2022::spl_token_2022::extension::transfer_fee::TransferFeeConfig;
+use anchor_spl::token_2022::spl_token_2022::extension::transfer_hook::TransferHook;
 use anchor_spl::token_2022::spl_token_2022::extension::{
-    BaseStateWithExtensions, PodStateWithExtensions,
+    BaseStateWithExtensions, ExtensionType, PodStateWithExtensions,
 };
 use anchor_spl::token_2022::spl_token_2022::pod::PodMint;
 use anchor_spl::token_interface::{
@@ -54,6 +56,7 @@ pub mod satomic_swap {
         amount: u64,
     ) -> Result<()> {
         require!(amount > 0, SwapError::ZeroAmount);
+        lock_time_as_timestamp(lock_time)?;
         require_keys_neq!(
             ctx.accounts.receiver.key(),
             Pubkey::default(),
@@ -155,6 +158,7 @@ pub mod satomic_swap {
         amount: u64,
     ) -> Result<()> {
         require!(amount > 0, SwapError::ZeroAmount);
+        lock_time_as_timestamp(lock_time)?;
         require_keys_neq!(
             ctx.accounts.receiver.key(),
             Pubkey::default(),
@@ -194,7 +198,8 @@ pub mod satomic_swap {
         Ok(())
     }
 
-    /// Claims an SPL payment by revealing the secret.
+    /// Claims an SPL payment by revealing the secret. The receiver gets everything the vault holds,
+    /// which is `amount` plus anything someone else deposited.
     pub fn receiver_spend_spl(
         ctx: Context<ReceiverSpendSpl>,
         secret: [u8; 32],
@@ -224,6 +229,10 @@ pub mod satomic_swap {
             &bump,
         ]];
 
+        // The whole balance, not just `amount`: anyone can deposit into the vault, and a token
+        // account that still holds tokens cannot be closed, so leaving any behind would make the
+        // payment impossible to spend or refund.
+        let balance = vault_balance(&ctx.accounts.vault, amount)?;
         transfer_checked(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.key(),
@@ -235,7 +244,7 @@ pub mod satomic_swap {
                 },
                 signer_seeds,
             ),
-            amount,
+            balance,
             ctx.accounts.mint.decimals,
         )?;
 
@@ -259,7 +268,8 @@ pub mod satomic_swap {
         Ok(())
     }
 
-    /// Refunds an SPL payment once `lock_time` has passed.
+    /// Refunds an SPL payment once `lock_time` has passed. The sender gets everything the vault
+    /// holds, which is `amount` plus anything someone else deposited.
     pub fn sender_refund_spl(
         ctx: Context<SenderRefundSpl>,
         secret_hash: [u8; 32],
@@ -285,6 +295,8 @@ pub mod satomic_swap {
             &bump,
         ]];
 
+        // The whole balance, for the same reason as in `receiver_spend_spl`.
+        let balance = vault_balance(&ctx.accounts.vault, amount)?;
         transfer_checked(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.key(),
@@ -296,7 +308,7 @@ pub mod satomic_swap {
                 },
                 signer_seeds,
             ),
-            amount,
+            balance,
             ctx.accounts.mint.decimals,
         )?;
 
@@ -322,10 +334,51 @@ pub mod satomic_swap {
 /// The refund path is the only thing the lock time gates: the receiver may spend with the secret at
 /// any point, exactly like the UTXO HTLC scripts the framework already uses.
 fn require_lock_time_expired(lock_time: u64) -> Result<()> {
-    let lock_time = i64::try_from(lock_time).map_err(|_| error!(SwapError::InvalidLockTime))?;
+    let lock_time = lock_time_as_timestamp(lock_time)?;
     let now = Clock::get()?.unix_timestamp;
     require!(now >= lock_time, SwapError::LockTimeNotExpired);
     Ok(())
+}
+
+/// The lock time as the `i64` that `Clock::unix_timestamp` is compared against.
+///
+/// Checked when the payment is made, not only on refund: a lock time that does not fit could never
+/// expire, so a payment that carried one could never be refunded.
+fn lock_time_as_timestamp(lock_time: u64) -> Result<i64> {
+    i64::try_from(lock_time).map_err(|_| error!(SwapError::InvalidLockTime))
+}
+
+/// What the vault holds, which is at least `amount` and can be more.
+///
+/// A token account accepts deposits from anyone, so the surplus is whatever someone sent it, before
+/// or after the payment. The vault cannot be closed while it holds any, so a spend or refund has to
+/// move all of it.
+fn vault_balance(vault: &InterfaceAccount<TokenAccount>, amount: u64) -> Result<u64> {
+    require_gte!(vault.amount, amount, SwapError::InsufficientVaultBalance);
+    Ok(vault.amount)
+}
+
+/// Runs `check` over a mint's Token-2022 extensions.
+///
+/// A classic SPL Token mint cannot carry extensions, so it passes. A Token-2022 mint whose data does
+/// not parse fails, as does an account owned by anything else: when in doubt, refuse the mint.
+fn check_mint_extensions(
+    mint: &AccountInfo,
+    check: impl FnOnce(&PodStateWithExtensions<PodMint>) -> bool,
+) -> bool {
+    if *mint.owner == anchor_spl::token::ID {
+        return true;
+    }
+    if *mint.owner != anchor_spl::token_2022::ID {
+        return false;
+    }
+    let Ok(data) = mint.try_borrow_data() else {
+        return false;
+    };
+    let Ok(state) = PodStateWithExtensions::<PodMint>::unpack(&data) else {
+        return false;
+    };
+    check(&state)
 }
 
 /// Whether this mint is safe to lock: it must not charge a transfer fee, nor be able to start.
@@ -339,23 +392,80 @@ fn require_lock_time_expired(lock_time: u64) -> Result<()> {
 /// rejected mint costs nothing. It is deliberately applied **only when the payment is made**:
 /// re-checking on spend or refund would let a fee authority trap funds mid-swap.
 pub fn mint_has_no_transfer_fee(mint: &AccountInfo) -> bool {
-    let Ok(data) = mint.try_borrow_data() else {
-        return false;
-    };
-    // Classic SPL Token mints carry no extensions, so this either fails to parse as an extended
-    // mint or simply reports no transfer fee config. Both are fine.
-    let Ok(state) = PodStateWithExtensions::<PodMint>::unpack(&data) else {
-        return true;
-    };
-    let Ok(config) = state.get_extension::<TransferFeeConfig>() else {
-        return true;
-    };
+    check_mint_extensions(mint, |state| {
+        let Ok(config) = state.get_extension::<TransferFeeConfig>() else {
+            return true;
+        };
 
-    let newer = u16::from(config.newer_transfer_fee.transfer_fee_basis_points);
-    let older = u16::from(config.older_transfer_fee.transfer_fee_basis_points);
-    let mutable = Option::<Pubkey>::from(config.transfer_fee_config_authority).is_some();
+        let newer = u16::from(config.newer_transfer_fee.transfer_fee_basis_points);
+        let older = u16::from(config.older_transfer_fee.transfer_fee_basis_points);
+        let mutable = Option::<Pubkey>::from(config.transfer_fee_config_authority).is_some();
 
-    newer == 0 && older == 0 && !mutable
+        newer == 0 && older == 0 && !mutable
+    })
+}
+
+/// Whether every Token-2022 extension on this mint leaves the vault to the swap alone: nobody but
+/// the payment PDA may be able to move its tokens, or stop them moving.
+///
+/// This is an allowlist. An extension not named here, including any Token-2022 adds later, is
+/// refused, because the failure modes are lopsided: refusing a harmless mint costs a swap that
+/// never starts, while accepting a harmful one can cost the funds of a swap already under way.
+///
+/// * Never accepted: `PermanentDelegate`, which can move the vault's tokens at will.
+/// * Accepted only if nobody can ever switch them on: `TransferHook` with no hook program and no
+///   authority to set one — this program forwards no hook accounts, so a hook would make every
+///   transfer out of the vault fail — and `Pausable`, unpaused and with no authority to pause it.
+/// * `TransferFeeConfig` is left to [`mint_has_no_transfer_fee`], so it keeps its own error.
+///
+/// The mint's freeze authority is accepted, because the most widely held stablecoins have one. It
+/// can freeze the vault, so a swap is only as safe as the issuer of the token it locks.
+///
+/// Like the transfer-fee check, this runs only when the payment is made. That is enough, because
+/// extensions cannot be added to a mint once it exists, and an accepted configuration has no
+/// authority left to change it.
+pub fn mint_extensions_are_supported(mint: &AccountInfo) -> bool {
+    check_mint_extensions(mint, |state| {
+        let Ok(extensions) = state.get_extension_types() else {
+            return false;
+        };
+
+        extensions.into_iter().all(|extension| match extension {
+            // Descriptive, or affecting only how amounts are displayed.
+            ExtensionType::MetadataPointer
+            | ExtensionType::TokenMetadata
+            | ExtensionType::GroupPointer
+            | ExtensionType::TokenGroup
+            | ExtensionType::GroupMemberPointer
+            | ExtensionType::TokenGroupMember
+            | ExtensionType::InterestBearingConfig
+            | ExtensionType::ScaledUiAmount => true,
+            // A mint can only be closed at zero supply, and the vault holds some of it.
+            ExtensionType::MintCloseAuthority => true,
+            // Sets the state of *new* accounts, which is no more than the freeze authority it
+            // requires can already do.
+            ExtensionType::DefaultAccountState => true,
+            // Confidential balances need an account the owner has configured for them, and only
+            // the payment PDA could configure the vault.
+            ExtensionType::ConfidentialTransferMint => true,
+            ExtensionType::TransferFeeConfig => true,
+            ExtensionType::TransferHook => {
+                state.get_extension::<TransferHook>().is_ok_and(|hook| {
+                    Option::<Pubkey>::from(hook.authority).is_none()
+                        && Option::<Pubkey>::from(hook.program_id).is_none()
+                })
+            }
+            ExtensionType::Pausable => {
+                state
+                    .get_extension::<PausableConfig>()
+                    .is_ok_and(|pausable| {
+                        Option::<Pubkey>::from(pausable.authority).is_none()
+                            && !bool::from(pausable.paused)
+                    })
+            }
+            _ => false,
+        })
+    })
 }
 
 #[derive(Accounts)]
@@ -437,7 +547,10 @@ pub struct SplPayment<'info> {
     pub sender: Signer<'info>,
     /// CHECK: only its key matters; bound into the PDA seeds.
     pub receiver: UncheckedAccount<'info>,
-    #[account(constraint = mint_has_no_transfer_fee(&mint.to_account_info()) @ SwapError::TransferFeeNotSupported)]
+    #[account(
+        constraint = mint_has_no_transfer_fee(&mint.to_account_info()) @ SwapError::TransferFeeNotSupported,
+        constraint = mint_extensions_are_supported(&mint.to_account_info()) @ SwapError::MintExtensionNotSupported,
+    )]
     pub mint: InterfaceAccount<'info, Mint>,
     #[account(
         mut,
@@ -462,8 +575,11 @@ pub struct SplPayment<'info> {
         bump,
     )]
     pub payment: Account<'info, Payment>,
+    /// `init_if_needed`, because anyone may create an associated token account for any owner and
+    /// this address follows from the payment's parameters, so with `init` creating it first would
+    /// block the payment. Whatever an early creator deposits is swept out with the payment.
     #[account(
-        init,
+        init_if_needed,
         payer = sender,
         associated_token::mint = mint,
         associated_token::authority = payment,

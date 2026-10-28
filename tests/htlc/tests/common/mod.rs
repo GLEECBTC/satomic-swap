@@ -80,27 +80,45 @@ pub fn expect_event<E: AnchorDeserialize + Discriminator>(logs: &[String]) -> E 
 /// requests far more overpays, because a priority fee is charged per *requested* unit rather than
 /// per consumed unit.
 ///
-/// Measured on LiteSVM, with the Token-2022 figure in brackets where it differs:
+/// The cost is not one number per instruction. Finding a PDA tries bumps from 255 downwards until
+/// one is off the curve, and every rejected bump costs [`cu::BUMP_STEP`] - so the cost depends on
+/// the payment's own addresses, and differs from swap to swap. The ceilings below are for an
+/// instruction whose searches all succeed first time; [`failed_bumps`] gives what to add.
 ///
-/// | instruction               | consumed          |
-/// |---------------------------|-------------------|
-/// | `lamports_payment`        |  8_349            |
-/// | `receiver_spend_lamports` |  4_888            |
-/// | `sender_refund_lamports`  |  4_098            |
-/// | `spl_payment`             | 37_424 [34_567]   |
-/// | `receiver_spend_spl`      | 13_134 [16_405]   |
-/// | `sender_refund_spl`       | 13_084            |
+/// Measured on LiteSVM, with the Token-2022 figure in brackets where it differs. `p` and `v` are
+/// the failed bumps for the payment PDA and for the vault:
 ///
-/// The ceilings sit well above those so a toolchain bump doesn't break CI, but close enough that a
-/// real regression - an added CPI, a loop over accounts - does.
+/// | instruction               | consumed                            |
+/// |---------------------------|-------------------------------------|
+/// | `lamports_payment`        |  8_815          + 1_500·p           |
+/// | `receiver_spend_lamports` |  5_172                              |
+/// | `sender_refund_lamports`  |  4_296                              |
+/// | `spl_payment`             | 32_802 [37_524] + 1_500·p + 4_500·v |
+/// | `receiver_spend_spl`      | 13_486 [16_760]           + 1_500·v |
+/// | `sender_refund_spl`       | 13_458 [16_733]           + 1_500·v |
+///
+/// Spends and refunds re-derive the payment PDA from its stored bump, which costs the same every
+/// time. `spl_payment` derives the vault's address three times in all, hence `4_500·v`.
+///
+/// The ceilings sit well above the base figures so a toolchain bump doesn't break CI, but close
+/// enough that a real regression - an added CPI, a loop over accounts - does.
 pub mod cu {
+    /// What each rejected bump in a PDA search costs.
+    pub const BUMP_STEP: u64 = 1_500;
+
     pub const LAMPORTS_PAYMENT: u64 = 12_000;
     pub const RECEIVER_SPEND_LAMPORTS: u64 = 8_000;
     pub const SENDER_REFUND_LAMPORTS: u64 = 8_000;
-    pub const SPL_PAYMENT: u64 = 50_000;
     /// Covers Token-2022, which costs more than classic SPL Token here.
+    pub const SPL_PAYMENT: u64 = 50_000;
     pub const RECEIVER_SPEND_SPL: u64 = 25_000;
     pub const SENDER_REFUND_SPL: u64 = 25_000;
+}
+
+/// How many bumps a PDA search rejected before settling on `bump`. KDF already derives these
+/// addresses to build the instructions, so it has the bumps too.
+pub fn failed_bumps(bump: u8) -> u64 {
+    255 - u64::from(bump)
 }
 
 /// Asserts an instruction stayed under its ceiling, and that it actually ran.

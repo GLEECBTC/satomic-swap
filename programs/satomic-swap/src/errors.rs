@@ -18,4 +18,6 @@ pub enum SwapError {
     LamportOverflow,
     #[msg("Mints with a transfer fee are not supported: the vault would receive less than the agreed amount")]
     TransferFeeNotSupported,
+    #[msg("This mint has an extension that could let someone other than the swap move or block the locked tokens")]
+    MintExtensionNotSupported,
 }

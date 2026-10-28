@@ -3,27 +3,29 @@
 //! These cover the cases the original program got wrong: refunding before the lock time, spending
 //! with the wrong secret, and substituting parameters that the PDA is supposed to bind.
 
-use anchor_lang::{InstructionData, ToAccountMetas};
+use anchor_lang::{Discriminator, InstructionData, ToAccountMetas};
 use litesvm::types::TransactionMetadata;
 use litesvm::LiteSVM;
 use solana_clock::Clock;
 use solana_instruction::Instruction;
 use solana_keypair::Keypair;
-use solana_pubkey::Pubkey;
+use solana_pubkey::{pubkey, Pubkey};
 use solana_signer::Signer;
 use solana_transaction::Transaction;
 
 mod common;
-use common::{assert_compute_units, cu, expect_event, TxFailure};
+use common::{assert_compute_units, cu, decode_events, expect_event, failed_bumps, TxFailure};
 use satomic_swap::events::{PaymentRefunded, PaymentSent, PaymentSpent};
 
 const PROGRAM_ID: Pubkey = satomic_swap::ID;
+const MEMO_PROGRAM: Pubkey = pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 const AMOUNT: u64 = 2_000_000_000;
 const LOCK_TIME: u64 = 1_800_000_000;
 
 // Anchor numbers custom errors from 6000 in declaration order.
 const E_INVALID_SECRET: u32 = 6002;
 const E_LOCK_TIME_NOT_EXPIRED: u32 = 6003;
+const E_INVALID_LOCK_TIME: u32 = 6004;
 const E_ZERO_AMOUNT: u32 = 6000;
 const E_INVALID_RECEIVER: u32 = 6001;
 
@@ -57,19 +59,34 @@ fn setup() -> Ctx {
     }
 }
 
-fn payment_pda(sender: &Pubkey, receiver: &Pubkey, secret_hash: &[u8; 32], amount: u64) -> Pubkey {
+fn payment_pda(
+    sender: &Pubkey,
+    receiver: &Pubkey,
+    secret_hash: &[u8; 32],
+    lock_time: u64,
+    amount: u64,
+) -> Pubkey {
+    find_payment_pda(sender, receiver, secret_hash, lock_time, amount).0
+}
+
+fn find_payment_pda(
+    sender: &Pubkey,
+    receiver: &Pubkey,
+    secret_hash: &[u8; 32],
+    lock_time: u64,
+    amount: u64,
+) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[
             b"payment",
             sender.as_ref(),
             receiver.as_ref(),
             secret_hash,
-            &LOCK_TIME.to_le_bytes(),
+            &lock_time.to_le_bytes(),
             &amount.to_le_bytes(),
         ],
         &PROGRAM_ID,
     )
-    .0
 }
 
 impl Ctx {
@@ -114,6 +131,7 @@ impl Ctx {
             &self.sender.pubkey(),
             &self.receiver.pubkey(),
             &self.secret_hash,
+            LOCK_TIME,
             AMOUNT,
         );
         let ix = Instruction {
@@ -137,13 +155,20 @@ impl Ctx {
         (payment, meta)
     }
 
-    /// A payment with an arbitrary receiver and amount, for the rejection cases.
+    /// A payment with an arbitrary receiver, amount and lock time, for the rejection cases.
     fn pay_with(
         &mut self,
         receiver: Pubkey,
         amount: u64,
+        lock_time: u64,
     ) -> Result<TransactionMetadata, TxFailure> {
-        let payment = payment_pda(&self.sender.pubkey(), &receiver, &self.secret_hash, amount);
+        let payment = payment_pda(
+            &self.sender.pubkey(),
+            &receiver,
+            &self.secret_hash,
+            lock_time,
+            amount,
+        );
         let ix = Instruction {
             program_id: PROGRAM_ID,
             accounts: satomic_swap::accounts::LamportsPayment {
@@ -155,7 +180,7 @@ impl Ctx {
             .to_account_metas(None),
             data: satomic_swap::instruction::LamportsPayment {
                 secret_hash: self.secret_hash,
-                lock_time: LOCK_TIME,
+                lock_time,
                 amount,
             }
             .data(),
@@ -439,6 +464,7 @@ fn a_third_party_substituting_itself_as_receiver_finds_no_payment() {
         &ctx.sender.pubkey(),
         &attacker.pubkey(),
         &ctx.secret_hash,
+        LOCK_TIME,
         AMOUNT,
     );
     let ix = Instruction {
@@ -564,7 +590,10 @@ fn a_zero_amount_payment_is_rejected() {
     let mut ctx = setup();
     let receiver = ctx.receiver.pubkey();
 
-    assert_eq!(ctx.pay_with(receiver, 0).unwrap_err().code(), E_ZERO_AMOUNT);
+    assert_eq!(
+        ctx.pay_with(receiver, 0, LOCK_TIME).unwrap_err().code(),
+        E_ZERO_AMOUNT
+    );
 }
 
 /// Paying yourself is not a swap, and it would let someone create a payment nobody else can
@@ -575,7 +604,7 @@ fn a_payment_to_myself_is_rejected() {
     let sender = ctx.sender.pubkey();
 
     assert_eq!(
-        ctx.pay_with(sender, AMOUNT).unwrap_err().code(),
+        ctx.pay_with(sender, AMOUNT, LOCK_TIME).unwrap_err().code(),
         E_INVALID_RECEIVER
     );
 }
@@ -586,8 +615,103 @@ fn a_payment_to_the_default_pubkey_is_rejected() {
     let mut ctx = setup();
 
     assert_eq!(
-        ctx.pay_with(Pubkey::default(), AMOUNT).unwrap_err().code(),
+        ctx.pay_with(Pubkey::default(), AMOUNT, LOCK_TIME)
+            .unwrap_err()
+            .code(),
         E_INVALID_RECEIVER
+    );
+}
+
+/// The refund compares the lock time with `Clock::unix_timestamp`, an `i64`, so a larger one could
+/// never pass and the payment could never be refunded.
+#[test]
+fn a_payment_whose_lock_time_can_never_pass_is_rejected() {
+    let mut ctx = setup();
+    let receiver = ctx.receiver.pubkey();
+
+    assert_eq!(
+        ctx.pay_with(receiver, AMOUNT, i64::MAX as u64 + 1)
+            .unwrap_err()
+            .code(),
+        E_INVALID_LOCK_TIME
+    );
+    ctx.pay_with(receiver, AMOUNT, i64::MAX as u64)
+        .expect("the largest lock time a clock can reach is fine");
+}
+
+// --- Reading the secret back ---
+
+/// The secret a lamports spend in `tx` revealed, read from the instruction data the way an
+/// integration should, rather than from `PaymentSpent`.
+///
+/// A spend's data is its discriminator followed by the secret; the SPL spend has the same layout
+/// under its own discriminator. This looks only at top-level instructions. A real client must also
+/// search the inner instructions in the transaction's metadata, since the receiver can spend
+/// through another program, and must check that the secret hashes to the payment's `secret_hash`.
+fn secret_from_spend(tx: &Transaction) -> Option<[u8; 32]> {
+    tx.message.instructions.iter().find_map(|ix| {
+        let program = tx
+            .message
+            .account_keys
+            .get(usize::from(ix.program_id_index))?;
+        if *program != PROGRAM_ID {
+            return None;
+        }
+        let rest = ix
+            .data
+            .strip_prefix(satomic_swap::instruction::ReceiverSpendLamports::DISCRIMINATOR)?;
+        rest.get(..32)?.try_into().ok()
+    })
+}
+
+/// Why the README tells integrations to take the secret from the spend instruction, not from
+/// `PaymentSpent`.
+///
+/// The runtime keeps only the first 10,000 bytes of a transaction's logs. A receiver who pads its
+/// spend with cheap instructions pushes the event past that cap: the claim still succeeds, but the
+/// event, and the secret in it, never reach the logs. A counterparty waiting for the event would
+/// miss its own claim window and lose its side of the swap. Instruction data cannot be dropped
+/// like that.
+#[test]
+fn a_padded_spend_keeps_its_event_out_of_the_logs_but_not_its_secret() {
+    let mut ctx = setup();
+    let payment = ctx.pay();
+
+    // Each one-byte memo costs about four bytes of transaction and logs about 240 bytes.
+    let mut ixs: Vec<Instruction> = (0..48)
+        .map(|_| Instruction {
+            program_id: MEMO_PROGRAM,
+            accounts: vec![],
+            data: b"x".to_vec(),
+        })
+        .collect();
+    ixs.push(ctx.spend_ix(payment, ctx.secret, AMOUNT));
+    let tx = Transaction::new_signed_with_payer(
+        &ixs,
+        Some(&ctx.receiver.pubkey()),
+        &[&ctx.receiver],
+        ctx.svm.latest_blockhash(),
+    );
+
+    let meta = ctx
+        .svm
+        .send_transaction(tx.clone())
+        .expect("the spend itself succeeds");
+    assert_eq!(
+        ctx.svm.get_balance(&payment).unwrap_or(0),
+        0,
+        "payment was settled"
+    );
+
+    assert!(meta.logs.iter().any(|line| line == "Log truncated"));
+    assert!(
+        decode_events::<PaymentSpent>(&meta.logs).is_empty(),
+        "the event never made it into the logs"
+    );
+    assert_eq!(
+        secret_from_spend(&tx),
+        Some(ctx.secret),
+        "but the instruction still carries the secret"
     );
 }
 
@@ -596,11 +720,19 @@ fn a_payment_to_the_default_pubkey_is_rejected() {
 #[test]
 fn lamports_instructions_stay_within_their_compute_budget() {
     let mut ctx = setup();
+    let (_, bump) = find_payment_pda(
+        &ctx.sender.pubkey(),
+        &ctx.receiver.pubkey(),
+        &ctx.secret_hash,
+        LOCK_TIME,
+        AMOUNT,
+    );
     let (payment, meta) = ctx.pay_with_logs();
+    // Spends and refunds use the stored bump, so only the payment searches for one.
     assert_compute_units(
         "lamports_payment",
         meta.compute_units_consumed,
-        cu::LAMPORTS_PAYMENT,
+        cu::LAMPORTS_PAYMENT + cu::BUMP_STEP * failed_bumps(bump),
     );
 
     let ix = ctx.spend_ix(payment, ctx.secret, AMOUNT);

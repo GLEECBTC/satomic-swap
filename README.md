@@ -23,6 +23,10 @@ other side. If nobody claims, both sides refund after their lock times expire.
 The lock time gates **only** the refund. The receiver may spend with the secret at any point,
 exactly like the UTXO HTLC scripts the framework already uses.
 
+`lock_time` is a Unix timestamp in seconds, compared with the cluster clock's `i64`. A payment whose
+lock time does not fit in an `i64` is refused, because it could never expire and so could never be
+refunded.
+
 ## The address is the commitment
 
 Every parameter that identifies a payment — sender, receiver, mint, secret hash, lock time and
@@ -41,8 +45,15 @@ reproducing its exact parameters — which includes funding the full amount.
 The account holds the funds itself (for SOL) or owns the vault token account (for SPL), and it is
 **closed** on spend or refund so the rent returns to whoever paid it. That matters if you are
 integrating: a settled payment's account no longer exists, so a client that looks one up by address
-and finds nothing must not conclude the payment was never made. Use the events, or
-`getSignaturesForAddress` on the PDA, to tell "never sent" from "already settled".
+and finds nothing must not conclude the payment was never made. Use `getSignaturesForAddress` on
+the PDA to tell "never sent" from "already settled".
+
+The SPL vault is an associated token account, and those take deposits from anyone, so it can hold
+more than `amount`. Its address follows from the payment's parameters too, so it can even be
+created before the payment is. Neither gets in the way: the payment accepts a vault that already
+exists, and a spend or refund moves the vault's **whole** balance before closing it, so whoever
+settles the payment also collects any surplus. Moving only `amount` would leave the vault
+impossible to close, which used to mean one stray token unit could lock a payment for good.
 
 ## Who can act
 
@@ -59,31 +70,62 @@ refund a payment out from under a receiver claiming late.
 Watcher support would mean relaxing this — any signer, seed-bound destinations — and would need
 re-auditing.
 
-## Events
-
-The three events are the only durable record once an account is closed, so integrations should
-treat them as the API rather than as a debugging aid.
+## Events, and where to read the secret
 
 | Event | Emitted by | Carries |
 |---|---|---|
 | `PaymentSent` | `lamports_payment`, `spl_payment` | payment, sender, receiver, mint (`None` for SOL), amount, lock time, secret hash |
-| `PaymentSpent` | `receiver_spend_*` | payment, receiver, amount, **the revealed secret** |
+| `PaymentSpent` | `receiver_spend_*` | payment, receiver, amount, the revealed secret |
 | `PaymentRefunded` | `sender_refund_*` | payment, sender, amount |
 
-`PaymentSpent.secret` is what the counterparty needs to claim the other side of the swap.
+The events are a convenience. **Do not take the secret from `PaymentSpent`.** Anchor's `emit!`
+writes events to the transaction's logs, and the runtime keeps only the first 10,000 bytes of those.
+A receiver who pads its spend with cheap instructions pushes the event out of the logs: the claim
+still succeeds, but a client waiting for the event never sees the secret, misses its own claim
+window, and loses its side of the swap. `tests/htlc/tests/lamports.rs` does exactly that with 48
+one-byte memos.
 
-## Mints with a transfer fee are rejected
+Read the secret from the spend instruction itself, which cannot be dropped:
 
-A Token-2022 mint that charges a transfer fee is refused at payment time, and so is a fee-free one
-whose `TransferFeeConfig` still has an authority that could add a fee later.
+1. Find the transactions with `getSignaturesForAddress` on the payment PDA.
+2. In each, look for an instruction to this program whose data starts with the
+   `receiver_spend_lamports` or `receiver_spend_spl` discriminator. Search the inner instructions
+   too: a receiver can spend through another program. The 32 bytes after the discriminator are the
+   secret.
+3. Check that it hashes to the payment's `secret_hash` before relying on it.
 
-With a fee, the vault receives less than `amount`, so either the receiver is short-changed or the
-sender has to over-send — neither is something a swap can silently absorb. The check runs as a
-constraint on the mint **before** the vault is created, so a rejected mint costs nothing. It is
-deliberately **not** re-checked on spend or refund: doing that would let a fee authority trap funds
-mid-swap by adding a fee after the payment was made.
+The same caution applies to anything else read from logs. Any program can log a line that looks
+exactly like one of these events, so a line counts only if it falls inside this program's own
+invocation.
 
-Classic SPL Token mints carry no extensions and are always accepted.
+## Which mints are accepted
+
+A payment is checked against its mint when it is made, as a constraint that runs **before** the
+vault is created, so a rejected mint costs nothing. The rule: nobody but the swap may be able to
+move the locked tokens, or stop them moving.
+
+- **Classic SPL Token** mints have no extensions and are always accepted.
+- **Token-2022** mints are accepted only if every extension they carry is on an allowlist. Anything
+  else, including any extension Token-2022 adds later, is refused with `MintExtensionNotSupported`.
+  - Accepted: token metadata and group pointers, interest-bearing and scaled-UI-amount configs
+    (they change only how amounts are displayed), a mint close authority (a mint can only be closed
+    at zero supply, and the vault holds some), default account state, and confidential transfers
+    (only the payment PDA could configure the vault for them).
+  - Accepted only if nobody can ever switch it on: a transfer hook with no hook program and no
+    authority, and a pausable config that is unpaused with no authority. This program forwards no
+    hook accounts, so a hook set mid-swap would block every transfer out of the vault.
+  - Never accepted: a permanent delegate, which can move the vault's tokens at will.
+- A **transfer fee** is refused with `TransferFeeNotSupported`, and so is a fee-free config whose
+  authority could add one later. With a fee, the vault receives less than `amount`, so either the
+  receiver is short-changed or the sender has to over-send.
+
+None of this is re-checked on spend or refund, and it need not be: extensions cannot be added to an
+existing mint, and every configuration accepted above has no authority left to change it.
+Re-checking would only hand such an authority a way to trap funds mid-swap.
+
+**The mint's freeze authority is accepted**, because USDC and USDT have one. It can freeze the
+vault, so a swap is only as safe as the issuer of the token it locks. KDF should only offer tokens
+whose issuer it trusts not to take sides in a swap.
 
 ## Compute budget
 
@@ -91,17 +133,27 @@ Callers should set an explicit `SetComputeUnitLimit`. Requesting fewer units tha
 uses fails it outright; requesting far more overpays, because a priority fee is charged per
 *requested* unit rather than per consumed unit.
 
+The cost is not fixed. Deriving a PDA tries bumps from 255 downwards, and each one rejected costs
+1,500 units, so an instruction's cost depends on the payment's own addresses. With `p` as
+`255 - bump` for the payment PDA and `v` the same for the vault, both from the
+`find_program_address` calls that build the instruction:
+
 | Instruction | Compute units | Token-2022 |
 |---|---|---|
-| `lamports_payment` | 8,349 | — |
-| `receiver_spend_lamports` | 4,888 | — |
-| `sender_refund_lamports` | 4,098 | — |
-| `spl_payment` | 37,424 | 34,567 |
-| `receiver_spend_spl` | 13,134 | 16,405 |
-| `sender_refund_spl` | 13,084 | — |
+| `lamports_payment` | 8,815 + 1,500·p | — |
+| `receiver_spend_lamports` | 5,172 | — |
+| `sender_refund_lamports` | 4,296 | — |
+| `spl_payment` | 32,802 + 1,500·p + 4,500·v | 37,524 + 1,500·p + 4,500·v |
+| `receiver_spend_spl` | 13,486 + 1,500·v | 16,760 + 1,500·v |
+| `sender_refund_spl` | 13,458 + 1,500·v | 16,733 + 1,500·v |
 
-These are pinned in `tests/htlc/tests/common/mod.rs`, which fails if an instruction grows past its
-ceiling. Regenerate this table if you change them.
+A fixed limit that ignores those terms works for most payments, then fails for one whose address
+needed a long search, and fails on every retry, because the address never changes. If that is a
+spend, it can keep failing until the sender is able to refund. Add a margin on top of the formula,
+or simulate the transaction and use its `unitsConsumed`.
+
+These figures are pinned in `tests/htlc/tests/common/mod.rs`, which fails if an instruction grows
+past its ceiling. Regenerate this table if you change them.
 
 ## Integrating without this crate
 

@@ -1,25 +1,28 @@
-//! HTLC tests for the SPL / Token-2022 path, including the transfer-fee rejection.
+//! HTLC tests for the SPL / Token-2022 path, including which mints are accepted.
 
 use anchor_lang::{InstructionData, ToAccountMetas};
 use litesvm::types::TransactionMetadata;
 use litesvm::LiteSVM;
 use solana_account::Account as SolanaAccount;
 use solana_clock::Clock;
-use solana_instruction::Instruction;
+use solana_instruction::{AccountMeta, Instruction};
 use solana_keypair::Keypair;
 use solana_program_pack::Pack;
 use solana_pubkey::{pubkey, Pubkey};
 use solana_signer::Signer;
 use solana_transaction::Transaction;
 use spl_token_2022_interface::extension::transfer_fee::instruction::initialize_transfer_fee_config;
-use spl_token_2022_interface::extension::ExtensionType;
-use spl_token_2022_interface::instruction::initialize_mint2;
+use spl_token_2022_interface::extension::{pausable, transfer_hook, ExtensionType};
+use spl_token_2022_interface::instruction::{
+    initialize_mint2, initialize_mint_close_authority, initialize_permanent_delegate,
+    set_authority, transfer_checked, AuthorityType,
+};
 use spl_token_2022_interface::state::{
     Account as TokenAccountState, AccountState, Mint as MintState,
 };
 
 mod common;
-use common::{assert_compute_units, cu, expect_event, TxFailure};
+use common::{assert_compute_units, cu, expect_event, failed_bumps, TxFailure};
 use satomic_swap::events::{PaymentRefunded, PaymentSent, PaymentSpent};
 
 const PROGRAM_ID: Pubkey = satomic_swap::ID;
@@ -34,7 +37,9 @@ const LOCK_TIME: u64 = 1_800_000_000;
 
 const E_INVALID_SECRET: u32 = 6002;
 const E_LOCK_TIME_NOT_EXPIRED: u32 = 6003;
+const E_INVALID_LOCK_TIME: u32 = 6004;
 const E_TRANSFER_FEE_NOT_SUPPORTED: u32 = 6007;
+const E_MINT_EXTENSION_NOT_SUPPORTED: u32 = 6008;
 const E_ZERO_AMOUNT: u32 = 6000;
 const E_INVALID_RECEIVER: u32 = 6001;
 
@@ -49,29 +54,106 @@ struct Ctx {
 }
 
 fn ata(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> Pubkey {
+    find_ata(owner, mint, token_program).0
+}
+
+fn find_ata(owner: &Pubkey, mint: &Pubkey, token_program: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(
         &[owner.as_ref(), token_program.as_ref(), mint.as_ref()],
         &ATA_PROGRAM,
     )
-    .0
 }
 
-/// Creates a real mint by sending the token program's own instructions, optionally with a
-/// transfer-fee config so we can prove the rejection fires.
+/// The ATA program's `Create`, which anyone may send for any owner.
+fn create_ata_ix(
+    payer: &Pubkey,
+    owner: &Pubkey,
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> Instruction {
+    Instruction {
+        program_id: ATA_PROGRAM,
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(ata(owner, mint, token_program), false),
+            AccountMeta::new_readonly(*owner, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(solana_system_interface::program::ID, false),
+            AccountMeta::new_readonly(*token_program, false),
+        ],
+        data: vec![0],
+    }
+}
+
+/// A Token-2022 mint extension a test wants, with the mint's creator holding whatever authority it
+/// carries. That is the position a counterparty who issued the token would be in.
+#[derive(Clone, Copy)]
+enum Extension {
+    TransferFee {
+        bps: u16,
+    },
+    PermanentDelegate,
+    /// No hook program yet, but an authority that can set one.
+    SwitchableTransferHook,
+    Pausable,
+    MintCloseAuthority,
+}
+
+impl Extension {
+    /// The extension's type, and the instruction that initializes it on `mint`.
+    fn init(
+        self,
+        token_program: &Pubkey,
+        mint: &Pubkey,
+        authority: &Pubkey,
+    ) -> (ExtensionType, Instruction) {
+        let (extension_type, ix) = match self {
+            Extension::TransferFee { bps } => (
+                ExtensionType::TransferFeeConfig,
+                initialize_transfer_fee_config(
+                    token_program,
+                    mint,
+                    Some(authority),
+                    Some(authority),
+                    bps,
+                    u64::MAX,
+                ),
+            ),
+            Extension::PermanentDelegate => (
+                ExtensionType::PermanentDelegate,
+                initialize_permanent_delegate(token_program, mint, authority),
+            ),
+            Extension::SwitchableTransferHook => (
+                ExtensionType::TransferHook,
+                transfer_hook::instruction::initialize(token_program, mint, Some(*authority), None),
+            ),
+            Extension::Pausable => (
+                ExtensionType::Pausable,
+                pausable::instruction::initialize(token_program, mint, authority),
+            ),
+            Extension::MintCloseAuthority => (
+                ExtensionType::MintCloseAuthority,
+                initialize_mint_close_authority(token_program, mint, Some(authority)),
+            ),
+        };
+        (extension_type, ix.unwrap())
+    }
+}
+
+/// Creates a real mint by sending the token program's own instructions, with whichever extensions
+/// a test needs to prove a rejection fires, or that a harmless one is still accepted.
 fn create_mint(
     svm: &mut LiteSVM,
     payer: &Keypair,
     token_program: Pubkey,
-    fee_bps: Option<u16>,
+    extensions: &[Extension],
 ) -> Pubkey {
     let mint = Keypair::new();
-    let space = match fee_bps {
-        Some(_) => ExtensionType::try_calculate_account_len::<MintState>(&[
-            ExtensionType::TransferFeeConfig,
-        ])
-        .unwrap(),
-        None => MintState::LEN,
-    };
+    let (types, inits): (Vec<_>, Vec<_>) = extensions
+        .iter()
+        .map(|extension| extension.init(&token_program, &mint.pubkey(), &payer.pubkey()))
+        .unzip();
+    let space = ExtensionType::try_calculate_account_len::<MintState>(&types).unwrap();
 
     let mut ixs = vec![solana_system_interface::instruction::create_account(
         &payer.pubkey(),
@@ -80,20 +162,8 @@ fn create_mint(
         space as u64,
         &token_program,
     )];
-    if let Some(bps) = fee_bps {
-        // The extension must be initialized before the mint itself.
-        ixs.push(
-            initialize_transfer_fee_config(
-                &token_program,
-                &mint.pubkey(),
-                Some(&payer.pubkey()),
-                Some(&payer.pubkey()),
-                bps,
-                u64::MAX,
-            )
-            .unwrap(),
-        );
-    }
+    // Extensions must be initialized before the mint itself.
+    ixs.extend(inits);
     ixs.push(
         initialize_mint2(
             &token_program,
@@ -156,6 +226,14 @@ fn put_token_account(
 }
 
 fn setup(token_program: Pubkey, fee_bps: Option<u16>) -> Ctx {
+    let fee: Vec<_> = fee_bps
+        .map(|bps| Extension::TransferFee { bps })
+        .into_iter()
+        .collect();
+    setup_with(token_program, &fee)
+}
+
+fn setup_with(token_program: Pubkey, extensions: &[Extension]) -> Ctx {
     let mut svm = LiteSVM::new();
     svm.add_program_from_file(PROGRAM_ID, "../../target/deploy/satomic_swap.so")
         .expect("run `anchor build` first");
@@ -165,7 +243,7 @@ fn setup(token_program: Pubkey, fee_bps: Option<u16>) -> Ctx {
     svm.airdrop(&sender.pubkey(), 100_000_000_000).unwrap();
     svm.airdrop(&receiver.pubkey(), 100_000_000_000).unwrap();
 
-    let mint = create_mint(&mut svm, &sender, token_program, fee_bps);
+    let mint = create_mint(&mut svm, &sender, token_program, extensions);
     put_token_account(&mut svm, &sender.pubkey(), &mint, &token_program, BALANCE);
     put_token_account(&mut svm, &receiver.pubkey(), &mint, &token_program, 0);
 
@@ -184,6 +262,10 @@ fn setup(token_program: Pubkey, fee_bps: Option<u16>) -> Ctx {
 
 impl Ctx {
     fn payment_pda(&self) -> Pubkey {
+        self.find_payment_pda().0
+    }
+
+    fn find_payment_pda(&self) -> (Pubkey, u8) {
         Pubkey::find_program_address(
             &[
                 b"payment_spl",
@@ -196,7 +278,14 @@ impl Ctx {
             ],
             &PROGRAM_ID,
         )
-        .0
+    }
+
+    /// The bumps rejected in finding this payment's PDA and its vault, which the compute ceilings
+    /// have to allow for: see `cu`.
+    fn failed_bumps(&self) -> (u64, u64) {
+        let (payment, payment_bump) = self.find_payment_pda();
+        let (_, vault_bump) = find_ata(&payment, &self.mint, &self.token_program);
+        (failed_bumps(payment_bump), failed_bumps(vault_bump))
     }
 
     fn send(
@@ -329,6 +418,7 @@ impl Ctx {
         &mut self,
         receiver: Pubkey,
         amount: u64,
+        lock_time: u64,
     ) -> Result<TransactionMetadata, TxFailure> {
         let payment = Pubkey::find_program_address(
             &[
@@ -337,7 +427,7 @@ impl Ctx {
                 receiver.as_ref(),
                 self.mint.as_ref(),
                 &self.secret_hash,
-                &LOCK_TIME.to_le_bytes(),
+                &lock_time.to_le_bytes(),
                 &amount.to_le_bytes(),
             ],
             &PROGRAM_ID,
@@ -359,13 +449,40 @@ impl Ctx {
             .to_account_metas(None),
             data: satomic_swap::instruction::SplPayment {
                 secret_hash: self.secret_hash,
-                lock_time: LOCK_TIME,
+                lock_time,
                 amount,
             }
             .data(),
         };
         let sender = self.sender.insecure_clone();
         self.send(ix, &sender)
+    }
+
+    /// Has someone who is neither party send `amount` tokens to `to`, as anyone holding the token
+    /// can.
+    fn deposit_from_outsider(&mut self, to: Pubkey, amount: u64) {
+        let outsider = Keypair::new();
+        self.svm.airdrop(&outsider.pubkey(), 1_000_000_000).unwrap();
+        let from = put_token_account(
+            &mut self.svm,
+            &outsider.pubkey(),
+            &self.mint,
+            &self.token_program,
+            amount,
+        );
+        let ix = transfer_checked(
+            &self.token_program,
+            &from,
+            &self.mint,
+            &to,
+            &outsider.pubkey(),
+            &[],
+            amount,
+            DECIMALS,
+        )
+        .unwrap();
+        self.send(ix, &outsider)
+            .expect("anyone may deposit into a token account");
     }
 
     fn send_without_all_signatures(
@@ -588,6 +705,160 @@ fn a_fee_free_mint_that_could_still_add_one_is_rejected() {
     assert_eq!(ctx.pay().unwrap_err().code(), E_TRANSFER_FEE_NOT_SUPPORTED);
 }
 
+#[test]
+fn a_mint_with_a_permanent_delegate_is_rejected() {
+    // The delegate can move the vault's tokens whenever it likes, including before anyone claims.
+    let mut ctx = setup_with(TOKEN_2022, &[Extension::PermanentDelegate]);
+    assert_eq!(
+        ctx.pay().unwrap_err().code(),
+        E_MINT_EXTENSION_NOT_SUPPORTED
+    );
+}
+
+#[test]
+fn a_transfer_hook_that_could_be_switched_on_is_rejected() {
+    // No hook yet, but its authority could set one mid-swap. This program forwards no hook
+    // accounts, so every transfer out of the vault would then fail until the authority chose to
+    // switch it off again - after the lock time, say, so that only the sender can collect.
+    let mut ctx = setup_with(TOKEN_2022, &[Extension::SwitchableTransferHook]);
+    assert_eq!(
+        ctx.pay().unwrap_err().code(),
+        E_MINT_EXTENSION_NOT_SUPPORTED
+    );
+}
+
+#[test]
+fn a_mint_that_can_be_paused_is_rejected() {
+    // The same trap as a switchable hook: pause until the lock time passes, then resume.
+    let mut ctx = setup_with(TOKEN_2022, &[Extension::Pausable]);
+    assert_eq!(
+        ctx.pay().unwrap_err().code(),
+        E_MINT_EXTENSION_NOT_SUPPORTED
+    );
+}
+
+/// The extension check is an allowlist, so this is the test that it does not refuse everything.
+#[test]
+fn extensions_that_cannot_touch_the_vault_are_accepted() {
+    let mut ctx = setup_with(
+        TOKEN_2022,
+        &[
+            Extension::MintCloseAuthority,
+            Extension::SwitchableTransferHook,
+        ],
+    );
+    let receiver_ata = ata(&ctx.receiver.pubkey(), &ctx.mint, &TOKEN_2022);
+
+    // Token-2022 will not create a hook with neither a program nor an authority, so one that can
+    // never be switched on is a hook whose authority was revoked.
+    let revoke = set_authority(
+        &TOKEN_2022,
+        &ctx.mint,
+        None,
+        AuthorityType::TransferHookProgramId,
+        &ctx.sender.pubkey(),
+        &[],
+    )
+    .unwrap();
+    let sender = ctx.sender.insecure_clone();
+    ctx.send(revoke, &sender)
+        .expect("the hook authority can give itself up");
+
+    let (payment, _) = ctx.pay().expect("these extensions should be accepted");
+    ctx.spend(payment, ctx.secret)
+        .expect("spend should succeed");
+    assert_eq!(ctx.token_balance(&receiver_ata), AMOUNT);
+}
+
+// --- Deposits into the vault ---
+//
+// A token account accepts deposits from anyone, and one that still holds tokens cannot be closed.
+// Both ways out of a payment close the vault, so both move its whole balance rather than `amount`:
+// moving only `amount` let a single token unit, sent by anyone, lock a payment for good.
+
+#[test]
+fn a_deposit_into_the_vault_does_not_stop_the_receiver_claiming() {
+    for token_program in [SPL_TOKEN, TOKEN_2022] {
+        let mut ctx = setup(token_program, None);
+        let receiver_ata = ata(&ctx.receiver.pubkey(), &ctx.mint, &token_program);
+        let (payment, _) = ctx.pay().expect("payment should succeed");
+        let vault = ata(&payment, &ctx.mint, &token_program);
+        ctx.deposit_from_outsider(vault, 1);
+
+        let meta = ctx
+            .spend(payment, ctx.secret)
+            .expect("spend should succeed");
+
+        let spent: PaymentSpent = expect_event(&meta.logs);
+        assert_eq!(spent.amount, AMOUNT, "the event reports the agreed amount");
+        assert_eq!(
+            ctx.token_balance(&receiver_ata),
+            AMOUNT + 1,
+            "the receiver gets the deposit along with the payment"
+        );
+        assert!(
+            ctx.svm
+                .get_account(&vault)
+                .map(|a| a.data.is_empty())
+                .unwrap_or(true),
+            "vault should be closed"
+        );
+    }
+}
+
+#[test]
+fn a_deposit_into_the_vault_does_not_stop_the_sender_refunding() {
+    for token_program in [SPL_TOKEN, TOKEN_2022] {
+        let mut ctx = setup(token_program, None);
+        let sender_ata = ata(&ctx.sender.pubkey(), &ctx.mint, &token_program);
+        let (payment, _) = ctx.pay().expect("payment should succeed");
+        let vault = ata(&payment, &ctx.mint, &token_program);
+        ctx.deposit_from_outsider(vault, 1);
+
+        ctx.warp_past_lock_time();
+        ctx.refund(payment)
+            .expect("refund should succeed after expiry");
+
+        assert_eq!(
+            ctx.token_balance(&sender_ata),
+            BALANCE + 1,
+            "the sender gets every token back, and the deposit"
+        );
+        assert!(
+            ctx.svm
+                .get_account(&vault)
+                .map(|a| a.data.is_empty())
+                .unwrap_or(true),
+            "vault should be closed"
+        );
+    }
+}
+
+/// The vault's address follows from the payment's parameters, and the ATA program lets anyone
+/// create an ATA for any owner. With plain `init`, doing that first made the payment fail.
+#[test]
+fn creating_the_vault_before_the_payment_does_not_block_it() {
+    let mut ctx = setup(SPL_TOKEN, None);
+    let receiver_ata = ata(&ctx.receiver.pubkey(), &ctx.mint, &SPL_TOKEN);
+    let payment = ctx.payment_pda();
+    let vault = ata(&payment, &ctx.mint, &SPL_TOKEN);
+
+    let outsider = Keypair::new();
+    ctx.svm.airdrop(&outsider.pubkey(), 1_000_000_000).unwrap();
+    let squat = create_ata_ix(&outsider.pubkey(), &payment, &ctx.mint, &SPL_TOKEN);
+    ctx.send(squat, &outsider)
+        .expect("creating an ATA is permissionless");
+    // An early creator can deposit before the payment, too.
+    ctx.deposit_from_outsider(vault, 1);
+
+    ctx.pay().expect("the payment should still go through");
+    assert_eq!(ctx.token_balance(&vault), AMOUNT + 1);
+
+    ctx.spend(payment, ctx.secret)
+        .expect("and still be claimable");
+    assert_eq!(ctx.token_balance(&receiver_ata), AMOUNT + 1);
+}
+
 // --- Authorization ---
 //
 // The same policy as on the lamports path, for the same reason: the seeds decide where the tokens
@@ -693,7 +964,10 @@ fn a_zero_amount_spl_payment_is_rejected() {
     let mut ctx = setup(SPL_TOKEN, None);
     let receiver = ctx.receiver.pubkey();
 
-    assert_eq!(ctx.pay_with(receiver, 0).unwrap_err().code(), E_ZERO_AMOUNT);
+    assert_eq!(
+        ctx.pay_with(receiver, 0, LOCK_TIME).unwrap_err().code(),
+        E_ZERO_AMOUNT
+    );
 }
 
 #[test]
@@ -702,7 +976,7 @@ fn an_spl_payment_to_myself_is_rejected() {
     let sender = ctx.sender.pubkey();
 
     assert_eq!(
-        ctx.pay_with(sender, AMOUNT).unwrap_err().code(),
+        ctx.pay_with(sender, AMOUNT, LOCK_TIME).unwrap_err().code(),
         E_INVALID_RECEIVER
     );
 }
@@ -712,8 +986,25 @@ fn an_spl_payment_to_the_default_pubkey_is_rejected() {
     let mut ctx = setup(SPL_TOKEN, None);
 
     assert_eq!(
-        ctx.pay_with(Pubkey::default(), AMOUNT).unwrap_err().code(),
+        ctx.pay_with(Pubkey::default(), AMOUNT, LOCK_TIME)
+            .unwrap_err()
+            .code(),
         E_INVALID_RECEIVER
+    );
+}
+
+/// The refund compares the lock time with `Clock::unix_timestamp`, an `i64`, so a larger one could
+/// never pass and the payment could never be refunded.
+#[test]
+fn an_spl_payment_whose_lock_time_can_never_pass_is_rejected() {
+    let mut ctx = setup(SPL_TOKEN, None);
+    let receiver = ctx.receiver.pubkey();
+
+    assert_eq!(
+        ctx.pay_with(receiver, AMOUNT, i64::MAX as u64 + 1)
+            .unwrap_err()
+            .code(),
+        E_INVALID_LOCK_TIME
     );
 }
 
@@ -724,8 +1015,13 @@ fn an_spl_payment_to_the_default_pubkey_is_rejected() {
 fn spl_instructions_stay_within_their_compute_budget() {
     for token_program in [SPL_TOKEN, TOKEN_2022] {
         let mut ctx = setup(token_program, None);
+        let (p, v) = ctx.failed_bumps();
         let (payment, meta) = ctx.pay().expect("payment should succeed");
-        assert_compute_units("spl_payment", meta.compute_units_consumed, cu::SPL_PAYMENT);
+        assert_compute_units(
+            "spl_payment",
+            meta.compute_units_consumed,
+            cu::SPL_PAYMENT + cu::BUMP_STEP * (p + 3 * v),
+        );
 
         let meta = ctx
             .spend(payment, ctx.secret)
@@ -733,17 +1029,18 @@ fn spl_instructions_stay_within_their_compute_budget() {
         assert_compute_units(
             "receiver_spend_spl",
             meta.compute_units_consumed,
-            cu::RECEIVER_SPEND_SPL,
+            cu::RECEIVER_SPEND_SPL + cu::BUMP_STEP * v,
         );
 
         let mut ctx = setup(token_program, None);
+        let (_, v) = ctx.failed_bumps();
         let (payment, _) = ctx.pay().expect("payment should succeed");
         ctx.warp_past_lock_time();
         let meta = ctx.refund(payment).expect("refund should succeed");
         assert_compute_units(
             "sender_refund_spl",
             meta.compute_units_consumed,
-            cu::SENDER_REFUND_SPL,
+            cu::SENDER_REFUND_SPL + cu::BUMP_STEP * v,
         );
     }
 }
